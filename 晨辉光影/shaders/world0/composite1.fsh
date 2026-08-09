@@ -24,6 +24,16 @@ in vec2 texcoord;
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
 
+// colortex0（gbuffers 主颜色 + alpha 方块光等级）用半浮点：
+// RGBA8 下 PRE_EXPOSURE 0.62 把漫反射量化精度砍掉 40%，圆石细颗粒
+// 纹理差（0.02~0.056）被量化压平（"材质被光照压住"）；16F 下
+// 纹值无损往返，HDR 高光（萤石 emission）也精确存储。
+// 声明包在块注释里：Iris 加载器识别 /* */ 内的格式 directive，
+// 裸声明在 Iris 1.7 会原样进入 GLSL 编译（RGBA16F 未定义 → C1503）
+/*
+const int colortex0Format = RGBA16F;
+*/
+
 #include "/lib/common.fsh"
 #include "/lib/noise.glsl"
 #include "/lib/sky.glsl"
@@ -103,7 +113,10 @@ void main() {
 		// 只对有点光的像素执行，纯黑场景零开销
 		float origB = texture(gcolor, texcoord).a;
 		if (origB > 0.004) {
-			float R = max(6.0, viewHeight * 0.016);
+			// 半径 0.8%（原 1.6%→1.1%）：光源影响范围收窄——方块光
+			// 本身已有距离衰减（calcLight 幂压缩），屏幕扩散只需
+			// 削平 16 级阶梯的边缘，不需要额外扩大光斑半径
+			float R = max(5.0, viewHeight * 0.008);
 			float st = R * 0.5;
 			vec2 px = vec2(1.0 / viewWidth, 1.0 / viewHeight);
 			float diffB = 0.0;
@@ -113,7 +126,9 @@ void main() {
 					vec2 off = texcoord + vec2(float(i), float(j)) * st * px;
 					if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
 					float d2 = texture(depthtex0, off).r;
-					float w = 1.0 - smoothstep(0.25, 1.0 + dist * 0.02, abs(linDepth(d2) - dist));
+					// 深度权重更严格（0.15 起、斜率放缓）：相邻方块表面
+					// 深度差更大 → 权重更快降 0，光不跨方块边界泄漏
+					float w = 1.0 - smoothstep(0.15, 0.7 + dist * 0.015, abs(linDepth(d2) - dist));
 					diffB += texture(gcolor, off).a * w;
 					wsum += w;
 				}
@@ -124,7 +139,10 @@ void main() {
 				// 不会把过渡带压成黑洞，也不会放大亮度噪声
 				float f0 = (diffB + 0.015) / (origB + 0.015);
 				float str = 1.0 - smoothstep(0.22, 0.34, origB);
-				float factor = clamp(1.0 + (f0 - 1.0) * 0.4 * str, 0.7, 1.3);
+				// 响应压缩 0.2、clamp [0.9,1.1]：萤石边缘对零亮度邻块的
+				// 提亮压到 ×1.1，光晕收敛到几乎察觉不到，消除
+				// "方块接缝漏光"的异常亮条
+				float factor = clamp(1.0 + (f0 - 1.0) * 0.2 * str, 0.9, 1.1);
 				color *= factor;
 			}
 		}
@@ -135,26 +153,43 @@ void main() {
 		float fogF = smoothstep(fogEnd * 0.8, fogEnd, dist) * fogAmt;
 		color = mix(color, fogC, fogF);
 	}
-	// ===== 逆预曝光 + 色调映射（修复高光溢出、泛白与暗部死黑） =====
-	// gbuffers 写入前已乘 PRE_EXPOSURE 0.62（把 HDR 压进 RGBA8 量化范围，
-	// 避免沙子/萤石 >1.0 被硬截断成纯白）。这里先恢复 color × 1/0.62（≈1.6129）
-	// 再乘 BRIGHTNESS/100（亮度选项在此生效）。
-	// ×0.72 整体曝光收敛：ACES 中间调增益大（0.5→0.62）会导致泛白，
-	// 换用 Reinhard 后其暗部近线性、整体偏暗，收敛系数相应放宽
-	color *= (1.0 / PRE_EXPOSURE) * (BRIGHTNESS / 100.0) * 0.72;
-	// Reinhard 映射 color/(1+color)：亮部软压缩（萤石不炸白、沙子不丢层次），
-	// 暗部近线性（x≈0.05 输出 ≈0.05）——不把夜晚背光面的微弱环境光压成 0，
-	// 这是 ACES 做不到的（ACES 在暗部呈平方压缩）
-	color = color / (color + 1.0);
-	// 对比度（只作用于中等/亮部，暗部原样保留）：以 0.5 为中心的偏移式
-	// 对比度有零点（1.12 时 x<0.054 全部打成 0），会把暗部直接杀成死黑；
-	// 用 smoothstep 掩码 cMask 保护暗部，只有亮度 >0.10 的像素才应用
+	// ===== 水下雾（线性空间） =====
+	// 眼睛在水中（isEyeInWater=1）时原版靠水下雾让远处景物被水色遮蔽——
+	// 缺失会让水底/水下远景清晰发亮。按距离混向深蓝绿水色：
+	// 8 格 ≈38%、20 格 ≈70%、50 格 ≈95%，近处景物仍可辨认
+	if (isEyeInWater > 0.5) {
+		float fogUnder = 1.0 - exp(-dist * 0.06);
+		color = mix(color, vec3(0.07, 0.20, 0.30), fogUnder);
+	}
+	// ===== 逆预曝光 + HDR 软压缩（修复光斑压平与高光溢出） =====
+	// gbuffers 写入前已乘 PRE_EXPOSURE 0.62（把 HDR 压进 RGBA8 量化范围），
+	// 这里恢复 color × 1/0.62（≈1.6129）再乘 BRIGHTNESS/100（亮度选项）。
+	// 不再做整体曝光收敛（原 ×0.62）：它会连光源光斑内部的亮度递减
+	// 一起压平——"光照没有递减、只有边缘突然下降"的根因之一
+	color *= (1.0 / PRE_EXPOSURE) * (BRIGHTNESS / 100.0);
+	// HDR 软压缩（保色度）：diffuse ≤ 1.0（原版 lightmap 上限）线性保留，
+	// 光斑亮度递减与纹理对比度原样映射；仅对 HDR 超限（太阳直射 ~1.4、
+	// 萤石 emission 叠加）压缩亮度、色度比率保留。
+	// 逐通道压缩会压扁色度（暖黄变白），不采用
+	float lumaT = dot(color, vec3(0.2126, 0.7152, 0.0722));
+	float hdrK = mix(1.0, 1.0 / max(lumaT, 1e-4), smoothstep(0.85, 1.25, lumaT));
+	color *= hdrK;
+	// 暗部保护：final 的暗部用弱伽马 1.4（不再线性直出），暗部不被
+	// 显示器压成死黑；保护系数 25%——纯暗处压到 25% 保留轮廓层次
+	// （0.35 时无光处整体抬得太平坦，均匀发亮像夜视），夜晚无光处
+	// 深色 ≈0.03 可辨、浅色 ≈0.08
+	float lumaDark = dot(color, vec3(0.2126, 0.7152, 0.0722));
+	color *= mix(0.25, 1.0, smoothstep(0.0, 0.12, lumaDark));
+	// 对比度：不再做——偏移式对比度（(x-0.5)×1.25+0.5）会把亮部
+	// （>0.9）推过 1.0 再 clamp：萤石 face（light 0.94 + emission 0.45
+	// ≈ 1.2）纹理差被整体压平（"萤石材质不明显"）；同时把 0.5 以下的
+	// 光斑外圈压暗（0.21→0.14），加深"深阴影圈"。中段直通无对比度，
+	// 用户认可中段——直出
 	float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-	float cMask = smoothstep(0.10, 0.30, luma);
-	color = mix(color, clamp((color - 0.5) * 1.12 + 0.5, 0.0, 1.0), cMask);
-	// 饱和度恢复（1.12）：找回沙子的暖黄、海水的蓝；1.25 过强（夜晚
-	// 环境光偏蓝紫时会发腻），收敛到 1.12
-	luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
-	color = clamp(mix(vec3(luma), color, 1.12), 0.0, 1.0);
+	// 饱和度：不再做增强——HDR 软压缩是亮度/色度同比例（保色度），
+	// 颜色本来就保留，不需要 Reinhard 时代的补偿。增强只会把光斑
+	// 中心的热色推成高饱和（"中心颜色饱和度过高"），并把萤石 face
+	// 变成 (1.0, 0.33, 0.09) 纯橙红、纹理被 clamp 压平（"萤石材质
+	// 不明显"）。直出 = 三分屏中段（直通）观感
 	fragOut0 = vec4(color, 1.0);
 }

@@ -59,7 +59,12 @@ void main() {
 	float smoothness = sp.r;
 	float metal = clamp(sp.g / 229.0, 0.0, 1.0);
 	float emissive = sp.a;
-	if (emissive > 0.999) emissive = 0.0;   // 255 = 忽略
+	if (emissive > 0.999) {
+		emissive = 0.0;   // 255 = 忽略
+		// 无 LabPBR specular 贴图（默认全白）＝原版哑光材质：
+		// smoothness 压到 0.15，消除太阳方向整片泛白高光
+		smoothness = min(smoothness, 0.15);
+	}
 
 	// 雨天湿润：表面反光增强、材质变暗
 	#ifdef RAIN_WET
@@ -77,8 +82,9 @@ void main() {
 	vec3 viewDir = normalize(viewPos);
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
 
-	// ---- 动态光源标记：高方块光判定 ----
-	float lightFlag = (texture(lightmap, lmcoord).b >= 0.84) ? 1.0 : 0.0;
-
+	// alpha 写方块光等级：composite1 的屏幕空间扩散用它柔化光斑边缘
+	// （光源旁 alpha 高，边缘像素向光斑内平均 → 边缘提亮柔和，
+	// 消除 16 级阶梯的硬边；白天太阳直射时 blockSourceLevel 自归零）。
+	// 之前写 1.0 导致扩散全屏空转、光斑边缘保持硬切
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 }

@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """晨辉光影 静态一致性检查"""
 import os, re, sys, io
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "晨辉光影", "shaders")
 errors = []

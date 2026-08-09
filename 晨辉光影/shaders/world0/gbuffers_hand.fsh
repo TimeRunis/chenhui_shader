@@ -56,7 +56,12 @@ void main() {
 	float smoothness = sp.r;
 	float metal = clamp(sp.g / 229.0, 0.0, 1.0);
 	float emissive = sp.a;
-	if (emissive > 0.999) emissive = 0.0;
+	if (emissive > 0.999) {
+		emissive = 0.0;
+		// 无 LabPBR specular 贴图（默认全白）＝原版哑光材质：
+		// smoothness 压到 0.15，消除太阳方向整片泛白高光
+		smoothness = min(smoothness, 0.15);
+	}
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 }

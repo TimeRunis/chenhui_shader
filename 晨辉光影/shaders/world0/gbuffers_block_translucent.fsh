@@ -59,7 +59,12 @@ void main() {
 	float smoothness = sp.r;
 	float metal = clamp(sp.g / 229.0, 0.0, 1.0);
 	float emissive = sp.a;
-	if (emissive > 0.999) emissive = 0.0;   // 255 = 忽略
+	if (emissive > 0.999) {
+		emissive = 0.0;   // 255 = 忽略
+		// 无 LabPBR specular 贴图（默认全白）＝原版哑光材质：
+		// smoothness 压到 0.15，消除太阳方向整片泛白高光
+		smoothness = min(smoothness, 0.15);
+	}
 
 	// 雨天湿润：表面反光增强、材质变暗
 	#ifdef RAIN_WET

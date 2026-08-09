@@ -72,7 +72,14 @@ void main() {
 	vec3 wn = waterNormalWorld(worldPos, amp);
 	n = normalize(mat3(gbufferModelView) * wn);
 
-	vec3 color = calcLight(albedo * 0.8, n, lmcoord, viewDir, worldPos, 0.92, 0.0, 0.0, SHADOW_QUALITY);
+	// 水面反射率：白天 ×0.4（深蓝，不再发白/压水底），夜晚 ×0.6
+	// （天光弱时保留蓝调轮廓，避免水面全黑）。
+	// df 是 calcLight 的局部变量，这里需自己取白天系数
+	float df = dayFactorF();
+	vec3 color = calcLight(albedo * mix(0.6, 0.4, df), n, lmcoord, viewDir, worldPos, 0.92, 0.0, 0.0, SHADOW_QUALITY);
 
-	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
+	// 水面透明度写入 alpha = 0.82（原版纹理 0.65 之上加深）——
+	// 岸上看水底，透出亮度 = (1-alpha)×水底显示值，0.65 时透出 35%
+	// 水底沙子仍显亮；0.82 时透出 18%，水色占绝对主导，水底不再"发光"
+	fragOut0 = vec4(color * PRE_EXPOSURE, 0.82);
 }

@@ -27,14 +27,17 @@ uniform int worldTime;
 uniform sampler2D lightmap;
 uniform sampler2D shadowtex0;
 
-// 预曝光系数：gbuffers 输出 colortex0（RGBA8，只能存 0~1）。高光（阳光直射的
-// 沙子 ~1.35、萤石自发光 ~3.3）直接写入会被硬截断 → 高光溢出、纹理全白丢失。
-// 写入前乘 0.62 把 HDR 压进量化范围保留层次，composite1 末尾 ÷0.62 恢复再 ACES
+// 预曝光系数：gbuffers 输出 colortex0（RGBA16F，半浮点，见 composite1 的
+// colortex0Format 声明）。16F 精度 ~0.0005，0~1 漫反射与 HDR 高光（萤石
+// emission ~1.2）都精确存储，PRE_EXPOSURE 只是数值缩放（可逆无损）——
+// composite1 ÷0.62 恢复时纹值原样回来，不再有 RGBA8 时代的量化压平
+// （0.564×0.62=0.35 → 8 位只剩 8 个量化级，"圆石材质被光照压住"的根因）
 #define PRE_EXPOSURE 0.62
 
-// 环境天光强度：夜晚暗部冷色环境光占比（0.20 = 暗部有蓝紫氛围，
-// 但不会喧宾夺主把阴影反差冲掉）
-#define AMBIENT_LIGHT_STRENGTH 0.20
+// 环境天光强度：夜晚暗部冷色环境光占比。光照模型要求夜晚
+// 「无光区域接近黑色」——环境光只许留极淡蓝紫轮廓，不允许
+// 覆盖材质（0.20 → 0.12 → 0.06 → 0.025 逐级下调）
+#define AMBIENT_LIGHT_STRENGTH 0.025
 
 // 深度线性化（近裁剪面/远裁剪面）
 float linDepth(float d) {
@@ -146,62 +149,89 @@ float blockSourceLevel(vec2 lmUV) {
 
 
 vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, float smoothness, float metal, float emissive, int shadowTaps) {
-	// 方块光照平滑：中心×2 + 十字 ±1.5 级 + 对角 ±2.5 级（10 点加权平均）。
-	// 对角权重更大 = 菱形 45° 尖角方向扩散更远 → 方形光斑圆化；
-	// 同时消除 16 级光照贴图的阶梯边缘。
-	// 所有采样点必须 clamp 到 [0.5/16, 15.5/16]（各级格中心范围，0.5/16 是
-	// 0 级格中心）：洞穴内 lmUV=(0,0) 时，未 clamp 的对角偏移 +2.5/16 会落到
-	// 2 级方块光格（亮度 0.133），把全黑洞穴抬到 ~0.05×albedo——"封住也亮"、
-	// 以及"光源边缘比光源外暗"的根源。clamp 后暗处所有采样点都留在 0 级格，
-	// 平滑只把光斑边缘往暗处混，永不把暗处往亮抬
-	const vec2 lmA = vec2(1.5 / 16.0);   // 十字（正交方向）偏移
-	const vec2 lmD = vec2(2.5 / 16.0);   // 对角（菱形尖角方向）偏移
+	// 方块光照直接采样（移除 10 点平滑核）：
+	// 平滑核（±1~2 级平均）会把光源本体拉暗（萤石 face 0.88→0.76，
+	// "萤石周围一圈阴影"）并把光斑内部的亮度递减抹平
+	// （"光照没有递减、边缘突然下降"）。
+	// 原版 lightmap 本身逐级递减（15 级 ≈ 15 格），直接采样与三分屏
+	// 中段（用户认可的 albedo×lightmap 观感）完全一致；方块面内由
+	// MC 平滑光照（per-vertex lightUV 插值）提供连续渐变。
+	// clamp 到格中心范围 [0.5/16, 15.5/16]（0 级格中心即最低）：
+	// 洞穴 lmUV=(0,0) 时不会采样到 0 级格之外
 	const vec2 lmMin = vec2(0.5 / 16.0);
 	const vec2 lmMax = vec2(15.5 / 16.0);
 	vec2 lmc = clamp(lmUV, lmMin, lmMax);
-	vec3 lm = (texture(lightmap, clamp(lmc - vec2(lmA.x, 0.0), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc + vec2(lmA.x, 0.0), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc - vec2(0.0, lmA.y), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc + vec2(0.0, lmA.y), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc - lmD, lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc + vec2(lmD.x, -lmD.y), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc + vec2(-lmD.x, lmD.y), lmMin, lmMax)).rgb
-	         + texture(lightmap, clamp(lmc + lmD, lmMin, lmMax)).rgb
-	         + texture(lightmap, lmc).rgb * 2.0) / 10.0;
-	float skyLm = lm.r;
+	vec3 lm = texture(lightmap, lmc).rgb;
+	float skyLm = lm.g;
 	float df = dayFactorF();
 	vec3 sd = sunDirV();
 	// 定向阴影（原始 0=全阴影 1=全亮）：shadowSample 在太阳相机空间做
 	// 深度比较，只计算太阳方向上的遮挡——阴影永远有明确方向
 	float sh = shadowSample(worldPos, n, shadowTaps);
 	float shadowAmt = 1.0 - sh;
-	// 阴影中的天光衰减（关键）：MC 光照图天空分量 lm.r 在阴影里仍是 100%，
-	// 若不衰减，天光会把阴影整个"冲掉"→ 地面阴影不可见。
-	// 阴影区域天光降至 60% = 阴影比普通暗部再低 40%。只衰减天空分量
-	// （方块光 lm.b 不受阳光遮挡影响）；只影响白天（乘 df）
-	vec3 lmShadow = lm;
-	lmShadow.r *= 1.0 - 0.4 * shadowAmt * df;
-	vec3 color = albedo * lmShadow;
+	// ===== 光照图正确提取（OptiFine 布局） =====
+	// r = max(天光, 方块光) 的显示亮度；g = 天光显示亮度；
+	// b = 方块光烘焙值（仅供 blockLevel 归一化，不做亮度）
+	// 天光 = g 通道；方块光 = r 通道本体（光源旁 r 就是方块光，
+	// 15 级 = 0.94 原版亮度），仅在方块光盖过天光时（r−g 明显）生效——
+	// 不减去天光（减了光源本体变暗），白天 r=g 自然归零
+	float skyRaw = lm.g;
+	// 方块光掩码：r 明显大于 g（方块光盖过天光）才取方块光，
+	// 白天/无光源处 r−g≈0 → 掩码 0
+	// 阈值 (0.02, 0.06) → (0.003, 0.015)：方块光 1~2 级时 r−g 只有
+	// 0.013~0.055，旧阈值把它们归入"天光区"→ 被夜晚衰减 ×0.15，
+	// 光斑最外圈（1 级 0.08）从天光（0.067）断崖掉到 0.012——
+	// "光源周围一圈深阴影"的根因
+	float blockMask = smoothstep(0.003, 0.015, lm.r - lm.g);
+	// 天光分量（仅供 ambient 门控 skyVis 使用，不参与漫反射 light）：
+	// 白天阴影衰减 + 夜晚衰减——ambient 只在"天光接近零"时关闭，
+	// 夜晚无光处保持弱门控（0.12），环境光不覆盖材质
+	float sky = skyRaw * (1.0 - 0.4 * shadowAmt * df);
+	sky *= mix(1.0, 0.15, 1.0 - df);
+	// ===== 照明合成（亮度锚点 = 原版 r 通道，颜色中性） =====
+	// 三分屏 debug 定论：① 原版 lightmap 的 r 通道（max 天光/方块光
+	// 显示亮度，永不超原版）是正确亮度锚点——纹理比例原样保留；
+	// ② lightmap 的 b 通道（方块光烘焙色 0.2~0.5）会把灰色材质
+	// 染成暖橙红（用户反馈"圆石覆盖一层光源颜色"），g 通道夜晚
+	// 太低导致颜色失真——颜色改由中性白提供，色温交给太阳项/
+	// 月光/环境光项各自负责；③ 合成色温（blockC/skyC、烘焙色
+	// 收敛）都会把混合光压偏（红色光斑/洗白），不采用。
+	// 白天阴影修正（只作用天光主导区）：阴影处天光 ×0.6~1，
+	// 火把/萤石旁（r−g 大）系数 = 1 保留原版亮度
+	float skyCorr = mix(1.0,
+		1.0 - 0.4 * shadowAmt * df,
+		1.0 - blockMask);
+	// 夜晚低光衰减（r 连续，无阶跃断崖）：r < 0.4（方块光 7 级以下/
+	// 天光）时夜晚平滑衰减到 0.3。注意 MC 1.20.1 夜晚天光 = 0.267
+	// （月光 1 级，不是 0.067）——旧区间 smoothstep(0.06, 0.12)
+	// 在 0.267 处=1 → 天光全量保留 = 原版月光亮度 = "夜视效果"。
+	// 现在：天光 0.267→0.10 暗（"夜晚接近黑色"），方块光 6 级
+	// 0.33→0.26、7 级 0.4→1 连续过渡——光斑 8 格内全量保留、
+	// 外圈平滑淡出，无阶跃断崖（0.15 全砍 = "深阴影圈"）
+	float nightK = mix(0.3, 1.0, smoothstep(0.25, 0.4, lm.r));
+	vec3 light = vec3(lm.r) * skyCorr * mix(1.0, nightK, 1.0 - df);
+	vec3 color = albedo * light;
 	// 太阳直射：阴影处完全无直射（硬阴影，亮面/阴影反差清晰）。
-	// 0.55 强度：与天光叠加、预曝光 0.62 与 ACES 后沙子不过曝不丢纹理
+	// 强度 0.15（diffuse）：lightmap 天光 15 级（0.94）本身已是
+	// 太阳直射亮度（原版沙子受光 0.85 显示）——旧 0.55 叠加在上面
+	// 让受光面达 1.1~1.33×albedo，沙子/草被 HDR 压到 1.0 发白
+	// （"白天过曝"）。0.15 只补朝阳面的方向层次，不做总量叠加
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
-	color += albedo * sunC * ndl * sh * df * (0.35 + 0.65 * skyLm);
+	color += albedo * vec3(1.0, 0.92, 0.78) * 0.15 * ndl * sh * df * (0.35 + 0.65 * skyLm);
 	// 月光
 	vec3 md = moonDirV();
 	float ndm = clamp(dot(n, md), 0.0, 1.0);
 	// 月光（只照到有天空光的地方）：深夜户外天光 1 级 ≈ 0.067 → moonK = 0.335，
-	// 月光 0.15×0.335 ≈ 0.05×albedo（与 0.35 基线相当）；洞穴/室内 skyLm=0 → 归零，
-	// 修复"无光处被月光抬亮"。clamp 上限防黄昏高天光时月光过爆
+	// 月光 0.02×0.335 ≈ 0.007×albedo——极淡的冷色轮廓点缀；
+	// 洞穴/室内 skyLm=0 → 归零。0.15→0.07→0.04→0.02 连续下调
 	float moonK = clamp(skyLm * 5.0, 0.0, 0.5);
-	color += albedo * vec3(0.5, 0.58, 0.85) * 0.15 * ndm * sh * (1.0 - df) * moonK;
+	color += albedo * vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK;
 	// 环境天光(ambient sky light)：微弱、偏蓝紫、不依赖法线方向的漫反射——
-	// 夜晚的背光面（树干阴面、地形背光坡）也能收到极少量天空光，
-	// 不再塌成纯黑二维剪纸，能隐约看清材质与起伏。
-	// skyLm 门控：洞穴/室内 skyLm=0 → 无环境光，保持漆黑；
-	// 法线朝上（n.y 大）的面略亮（天空光主要来自上方）；
-	// 白天被 (1.0 - df) 关掉，不影响白昼亮度
-	float skyVis = clamp(skyLm * 8.0, 0.0, 1.0);
+	// 夜晚背光面（树干阴面、地形背光坡）收到极少量天空光。
+	// 门控用衰减后的天光 sky：夜晚户外 0.04×12≈0.48 半开、洞穴≈0 关闭、
+	// 白天被 (1.0 - df) 关掉——不覆盖材质，只留一丝轮廓
+	float skyVis = clamp(sky * 12.0, 0.0, 1.0);
 	// 暗部冷色调环境光：AMBIENT_LIGHT_STRENGTH 强度（0.20 基线 + 法线
 	// 朝上略亮）——夜晚暗部呈蓝紫氛围，与月光直射面冷暖对比。
 	// 阴影区域环境光再衰减 50%：ambient 不覆盖 shadow，
@@ -216,7 +246,12 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float ndh = clamp(dot(n, h), 0.0, 1.0);
 	vec3 specC = mix(vec3(1.0), albedo, metal * 0.9);
 	color += specC * sunC * pow(ndh, shiny) * sh * df * smoothness * 1.1;
-	// 自发光
-	color += albedo * emissive * 2.2;
+	// 自发光（emission）：
+	// finalColor = surfaceColor(baseColor×lighting) + emission
+	// emission = emissiveMask × baseColor × emissionStrength——
+	// 发光色继承纹理（亮区发光强、暗区弱），不会替代材质颜色，
+	// 也不会把纹理冲淡成纯色；强度 0.45（0.3~0.6 设计范围）。
+	// 原版材质无 specular 贴图（emissive 归零）不受影响
+	color += albedo * emissive * 0.45;
 	return color;
 }
