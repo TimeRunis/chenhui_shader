@@ -1,0 +1,10 @@
+# 备份目录(不纳入版本控制)
+debug_min/
+晨辉光影_bac/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 部署暂存文件
+*.staging.tmp
