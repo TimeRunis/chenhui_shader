@@ -1,4 +1,5 @@
 #version 450 compatibility
+/* RENDERTARGETS: 0,1,2 */
 
 uniform sampler2D texture;
 uniform sampler2D specular;
@@ -12,9 +13,10 @@ in vec3 normalV;
 
 // ===== 晨辉光影 选项（各文件定义必须完全一致） =====
 #define CLOUDS 2 // 体积云 [0 1 2 3]
+#define CLOUD_DENSITY 150 // 云密度 [50 75 100 125 150 175 200]
 #define CLOUD_SHADOW 40 // 云影强度 [0 20 40 60 80 100]
 #define WATER_REFLECT 1 // 水面反射 [0 1 2]
-#define LIGHT_GLOW 60 // 动态光源强度 [0 20 40 60 80 100]
+#define LIGHT_GLOW 100 // 手持光源强度 [0 20 40 60 80 100]
 #define LIGHT_FLICKER 1 // 光源闪烁 [0 1]
 #define GODRAYS 1 // 丁达尔效应 [0 1 2]
 #define SUN_GLOW 80 // 太阳光晕 [[0 25 50 60 75 80 100]]
@@ -35,8 +37,14 @@ in vec3 normalV;
 #include "/lib/common.fsh"
 uniform float alphaTestRef;
 
+// Iris 支持的 OptiFine 兼容 uniform：主手/副手手持方块的光照等级
+// （0~15，火把 14、萤石/灯笼 15、空手 0）
+uniform int heldBlockLightValue;
+uniform int heldBlockLightValue2;
 
 layout(location = 0) out vec4 fragOut0;
+layout(location = 2) out vec4 fragOut2;
+layout(location = 1) out vec4 fragOut1;
 void main() {
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
@@ -64,4 +72,10 @@ void main() {
 	}
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
+	fragOut2 = vec4(albedo, 1.0);
+	// 手持光源材质色写入 colortex1（composite1 物品区域采样取光源色）：
+	// 物品像素写 albedo×等级与等级——火把=暖橙、萤石=白、灯笼=橙、
+	// 海晶灯=蓝白，随手持物品变化；非光源物品写 0
+	float handLvl = max(float(heldBlockLightValue), float(heldBlockLightValue2));
+	fragOut1 = vec4(albedo * clamp(handLvl, 0.0, 1.0), clamp(handLvl, 0.0, 1.0));
 }

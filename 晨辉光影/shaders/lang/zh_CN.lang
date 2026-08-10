@@ -5,6 +5,9 @@ value.CLOUDS.1=低
 value.CLOUDS.2=中
 value.CLOUDS.3=高
 
+option.CLOUD_DENSITY=云密度
+option.CLOUD_DENSITY.comment=云层不透明度，越高云越浓厚，越低云越轻薄
+
 option.CLOUD_SHADOW=云影强度
 option.CLOUD_SHADOW.comment=阳光穿过云层投在大地上的阴影浓淡
 
@@ -14,8 +17,8 @@ value.WATER_REFLECT.0=关闭
 value.WATER_REFLECT.1=低
 value.WATER_REFLECT.2=高
 
-option.LIGHT_GLOW=动态光源强度
-option.LIGHT_GLOW.comment=火把、灯笼、岩浆等光源的屏幕空间光晕强度，夜晚氛围关键
+option.LIGHT_GLOW=手持光源强度
+option.LIGHT_GLOW.comment=手持发光物品时照亮周围方块的光强，100 时与放置光源完全相同
 
 option.LIGHT_FLICKER=光源闪烁
 option.LIGHT_FLICKER.comment=火把等光源的火焰闪烁效果

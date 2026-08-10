@@ -1,4 +1,5 @@
 #version 450 compatibility
+/* RENDERTARGETS: 0,1,2 */
 // 地形主通道：PBR（LabPBR）+ 动态光源标记
 // 基础顶点格式（兼容 Iris 1.7 全部地形阶段），细节法线用近似扰动
 
@@ -15,9 +16,10 @@ in vec3 normalV;
 
 // ===== 晨辉光影 选项（各文件定义必须完全一致） =====
 #define CLOUDS 2 // 体积云 [0 1 2 3]
+#define CLOUD_DENSITY 150 // 云密度 [50 75 100 125 150 175 200]
 #define CLOUD_SHADOW 40 // 云影强度 [0 20 40 60 80 100]
 #define WATER_REFLECT 1 // 水面反射 [0 1 2]
-#define LIGHT_GLOW 60 // 动态光源强度 [0 20 40 60 80 100]
+#define LIGHT_GLOW 100 // 手持光源强度 [0 20 40 60 80 100]
 #define LIGHT_FLICKER 1 // 光源闪烁 [0 1]
 #define GODRAYS 1 // 丁达尔效应 [0 1 2]
 #define SUN_GLOW 80 // 太阳光晕 [[0 25 50 60 75 80 100]]
@@ -41,6 +43,7 @@ uniform float alphaTestRef;
 #include "/lib/noise.glsl"
 
 layout(location = 0) out vec4 fragOut0;
+layout(location = 2) out vec4 fragOut2;
 void main() {
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
@@ -86,4 +89,5 @@ void main() {
 	float lightFlag = (texture(lightmap, lmcoord).b >= 0.84) ? 1.0 : 0.0;
 
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
+	fragOut2 = vec4(albedo, 1.0);
 }

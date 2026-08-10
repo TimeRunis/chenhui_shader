@@ -1,4 +1,5 @@
 #version 450 compatibility
+/* RENDERTARGETS: 0,1,2 */
 // 流体通道：水面（波浪+反射标记）与岩浆（自发光+光源标记）
 // 岩浆用颜色启发式识别（橙红 vs 蓝绿），不依赖方块 ID 属性
 
@@ -13,9 +14,10 @@ in vec3 normalV;
 
 // ===== 晨辉光影 选项（各文件定义必须完全一致） =====
 #define CLOUDS 2 // 体积云 [0 1 2 3]
+#define CLOUD_DENSITY 150 // 云密度 [50 75 100 125 150 175 200]
 #define CLOUD_SHADOW 40 // 云影强度 [0 20 40 60 80 100]
 #define WATER_REFLECT 1 // 水面反射 [0 1 2]
-#define LIGHT_GLOW 60 // 动态光源强度 [0 20 40 60 80 100]
+#define LIGHT_GLOW 100 // 手持光源强度 [0 20 40 60 80 100]
 #define LIGHT_FLICKER 1 // 光源闪烁 [0 1]
 #define GODRAYS 1 // 丁达尔效应 [0 1 2]
 #define SUN_GLOW 80 // 太阳光晕 [[0 25 50 60 75 80 100]]
@@ -40,6 +42,9 @@ uniform float alphaTestRef;
 #include "/lib/water.glsl"
 
 layout(location = 0) out vec4 fragOut0;
+layout(location = 2) out vec4 fragOut2;
+layout(location = 1) out vec4 fragOut1;
+
 void main() {
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
@@ -64,6 +69,7 @@ void main() {
 		float flick = 0.8 + 0.2 * hash1(floor(frameTimeCounter * 12.0) + floor(worldPos.y * 2.0));
 		vec3 color = albedo * (0.55 + 0.85 * flick) + vec3(0.6, 0.2, 0.02) * flick * 3.2;
 		fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
+		fragOut1 = vec4(0.0, 0.0, 0.0, 1.0);
 		return;
 	}
 
@@ -82,4 +88,9 @@ void main() {
 	// 岸上看水底，透出亮度 = (1-alpha)×水底显示值，0.65 时透出 35%
 	// 水底沙子仍显亮；0.82 时透出 18%，水色占绝对主导，水底不再"发光"
 	fragOut0 = vec4(color * PRE_EXPOSURE, 0.82);
+	fragOut2 = vec4(albedo, 1.0);
+	// 水面片元深度（非线性 d）写入 colortex1：composite1 的 SSR 用它
+	// 重建反射起点——depthtex0 在半透明水面处是水底/天空的深度，
+	// 不能用于水面反射起点（用了会错位/负片，见 composite1 注释）
+	fragOut1 = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);
 }

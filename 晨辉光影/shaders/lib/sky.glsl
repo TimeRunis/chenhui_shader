@@ -52,14 +52,127 @@ float cloudDensity(vec2 xz, float y) {
 	return cov * shape * detail;
 }
 
-// 云光照
-vec3 cloudShade(float dens, float df, float wet) {
+// 云光照：把 volCloud 累积的平均散射光照（0~1，含前向散射与自阴影）
+// 映射为颜色。旧版签名里的 dens 参数从未被使用（函数体只读太阳高度）
+// → 整片云统一亮白，无明暗变化；现在颜色随 avgLit 渐变。
+// 基础色：暗部（背光/自阴影）冷蓝灰 → 亮部（迎光）暖白；
+// 再叠加太阳低角度时的黄昏橙光（warm 太阳倾斜因子，正午≈0）
+vec3 cloudShade(float avgLit, float df, float wet) {
 	vec3 sd = sunDirW();
-	float lit = clamp(sd.y * 3.0 + 0.35, 0.12, 1.0) * df + (1.0 - df) * 0.1;
-	vec3 col = mix(vec3(0.28, 0.32, 0.4), vec3(0.78, 0.83, 0.92), lit);
-	col += vec3(1.0, 0.82, 0.62) * lit * df * 0.55;
+	float sdY = clamp(sd.y, 0.0, 1.0);
+	float warm = exp(-sdY * 9.0) * smoothstep(0.10, 0.30, df);
+	// 昼夜基础：夜晚云暗蓝（月光下 0.06 亮度），白天亮白
+	vec3 col = mix(vec3(0.05, 0.07, 0.12), vec3(0.92, 0.94, 0.97), df);
+	// 散射光照调制：avgLit 0→暗部色（背光云），1→亮部（迎光云）
+	col = mix(col * 0.18, col, clamp(avgLit * 1.35, 0.0, 1.0));
+	// 黄昏暖橙：太阳低角度时云底染橙，强度随 warm 呼吸
+	col += vec3(1.0, 0.72, 0.42) * warm * df * (0.25 + 0.75 * avgLit);
 	col *= 1.0 - wet * 0.5;                 // 雨天云层变暗
 	return col;
+}
+
+// ===== 稳定高度云层（ray-cloud intersection，仅主世界） =====
+// 云层是两平行平面（y=CLOUD_BASE ~ y=CLOUD_TOP）之间的世界空间
+// 水平带。视线与两平面交点的参数 t 取 min/max 排序，相机在层下
+// （仰视）、层内（穿层）、层上（俯视云海）三种位置统一处理——
+// 不再有"相机高于云顶则 t1<0 云消失"、或"相机接近云层时平视
+// 交点 >900 截断云带消失"的高度耦合。
+// 采样策略（radial stretching 修复）：步长上限 10 格 = 0.08 噪声
+// 周期。旧版步数固定，掠射角（地平线方向）路径 170+ 格 → 步长
+// 28~100+ 格，径向欠采样 → 云纹沿视线方向拉伸，从屏幕中心向外
+// 发散。上限 10 格后任意方向采样密度一致；路径超长时按 t 提前
+// 退出（地平线细云带占屏很小，截断不可见）。
+// 云形：水平 fbm2 大尺度做主覆盖（团块形状来源）+ 弱 3D 细节
+// （体积感）。垂直层界淡出 + 底缘噪声起伏（独立云团高度变化）。
+// 光照：透明度（dens）与散射光（lit）分开累积——透射强度只由
+// 几何密度决定，亮度另算前向散射（视线朝向太阳的云亮）与自阴影
+// （密云背光侧暗），云团有迎光/背光面。
+// 步长起点按像素 hash 抖动（固定幅度 ~3 格，不随 dt 放大——
+// 旧版抖动 = hash×dt×0.8，边缘步长 28 格时抖动 22 格跨周期，
+// 叠加出放射状条纹），消除带状条纹。
+// cloudLevel：调用方传入 CLOUDS 选项值（0 关 / 1 低 / 2 中 / 3 高）
+// cloudDensity：调用方传入 CLOUD_DENSITY/100（1.0 = 基准，1.5 = 1.5 倍）
+// ——lib 文件不允许直接用选项宏
+vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDensity) {
+	if (cloudLevel < 0.5) return skyCol;
+	// 纯平视（|dir.y| < 0.001）：交点趋近无穷，云带退化为地平线
+	// 细线，省略采样（也避免除零）
+	if (abs(dir.y) < 0.001) return skyCol;
+	float camY = cameraPosition.y;
+	float tA = (CLOUD_BASE - camY) / dir.y;   // 与层底平面交点
+	float tB = (CLOUD_TOP - camY) / dir.y;    // 与层顶平面交点
+	float tNear = min(tA, tB);
+	float tFar = max(tA, tB);
+	if (tFar <= 0.0) return skyCol;           // 云层完全在身后
+	tNear = max(tNear, 0.0);                  // 相机在层内：从相机起
+	// 安全上限：防平视方向 t 巨大时的浮点精度退化；相机高度不影响
+	// 相交区间（世界空间高度锚定），投影范围不再随高度异常缩小
+	float maxT = min(tFar, 4000.0);
+	if (tNear >= maxT) return skyCol;
+	int maxSteps = (cloudLevel > 2.5) ? 16 : ((cloudLevel > 1.5) ? 12 : 8);
+	// 步长上限 10 格：掠射角下路径 170+ 格，固定步数会让步长拉到
+	// 0.2~0.8 噪声周期（radial stretching 根因）；上限后任意方向
+	// 采样密度一致，路径超长时循环内按 t 提前退出
+	float dt = min((maxT - tNear) / float(maxSteps), 10.0);
+	float t = tNear;
+	float dens = 0.0;   // 透明度累积（几何密度）
+	float lit = 0.0;    // 散射光累积（密度 × 前向散射 × 自阴影）
+	int cnt = 0;
+	vec3 sd = sunDirW();
+	float sunFwd = max(dot(dir, sd), 0.0);    // 视线-太阳夹角（前向散射）
+	for (int i = 0; i < maxSteps; i++) {
+		if (t > maxT) break;
+		vec3 p = cameraPosition + dir * (t + dt * 0.5);
+		// 抖动固定 3 格（< 10 格步长、0.08 周期），不随 dt 放大；
+		// 只抖 xz（垂直位置保持精确，不推出层界）
+		p += vec3(hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3) * 3.0, 0.0,
+		          hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3 + 7.7) * 3.0);
+		// 水平主覆盖（云团形状来源）：大尺度 xz，3 oct 值域 0~0.875
+		// 均值 0.5。阈值 0.58~0.66 上移至分布上尾且过渡带收窄——
+		// 均值处 cov≈0，只有噪声峰值（~30% 区域）成云，团间露出
+		// 天空 → 独立云团而非连续雾；窄过渡带 = 云边缘锐利清晰
+		// （旧 0.55~0.72 过渡带 0.17 太宽，边缘模糊成雾）
+		vec2 uv = p.xz * 0.006 + vec2(frameTimeCounter * 0.006, 0.0);
+		float cov = smoothstep(0.58, 0.66, fbm2(uv, 3));
+		// 3D 体积细节（弱，0.75~1.05）：垂直小扰动保持体积感，
+		// 不再用 fbm3 的 z 折叠塞满垂直频率（那是连续雾的来源之一）
+		float vol = fbm3(p * 0.02, 2);
+		cov *= 0.75 + 0.5 * vol;
+		// 团块调制（0.55~0.9，比旧 0.35~1.4 弱）：团块明暗保留
+		// 但不再把边缘打成毛边——调制过强时 cov 乘子在边缘来回
+		// 跳动，边缘轮廓被噪声"嚼碎"变模糊
+		float clump = fbm2(uv * 2.5 + vec2(7.3, 2.1), 2);
+		cov *= 0.55 + 0.7 * clump;
+		// 垂直层界：密度只存在于 CLOUD_BASE~CLOUD_TOP 世界高度带
+		// 内，层底/层顶 18% 平滑淡出（比旧 12% 略陡，云层主体更实）
+		float ty = (p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE);
+		float shape = smoothstep(0.0, 0.18, ty)
+		            * (1.0 - smoothstep(0.82, 1.0, ty));
+		float d = cov * shape;
+		// 太阳光照（逐采样点）：前向散射（视线朝向太阳的云亮，
+		// pow 6 收窄到太阳附近）+ 自阴影（密云内部太阳光被吸收，
+		// 背光侧暗）——云团有迎光/背光面明暗变化
+		float scat = 0.25 + 0.75 * pow(sunFwd, 6.0);
+		float selfSh = 1.0 - 0.55 * smoothstep(0.1, 0.55, d);
+		dens += d;
+		lit += d * scat * selfSh;
+		cnt++;
+		t += dt;
+	}
+	if (cnt == 0) return skyCol;
+	dens /= float(cnt);
+	lit /= float(cnt);
+	// 密度倍率（CLOUD_DENSITY/100，默认 150 = 1.5 倍）：只放大
+	// 不透明度 dens——avgLit = lit/dens 不受影响，亮度保持
+	dens *= cloudDensity;
+	// 透射 ×3（原 ×6）：dens≈0.2 时 trans=0.45，天空底色保留更多
+	// ——体积散射感而非白色叠加（旧 0.70 直接盖掉天空）
+	float trans = 1.0 - exp(-dens * 3.0);
+	// 平均散射光照 = lit/dens（每密度单位的散射光，0~1）：
+	// 朝向太阳的云 avgLit 高 → 亮，背光/密云 → 暗
+	float avgLit = (dens > 0.001) ? lit / dens : 0.0;
+	vec3 ccol = cloudShade(clamp(avgLit, 0.0, 1.0), df, wetness);
+	return mix(skyCol, ccol, clamp(trans, 0.0, 1.0));
 }
 
 // ===== 月亮：固定满月 + 细节 =====
@@ -135,10 +248,22 @@ vec3 sunDetail(vec3 dir, float size) {
 }
 
 // ===== 主世界天空 =====
-vec3 overworldSky(vec3 dir, float stars, float sunGlow, float sunSize, float moonSize, float starDensity) {
+vec3 overworldSky(vec3 dir, float stars, float sunGlow, float sunSize, float moonSize, float starDensity, float cloudLevel, float cloudDensity) {
 	float df = dayFactorF();
 	vec3 sd = sunDirW();                    // 世界空间太阳方向（与 dir 同空间）
 	float up = max(dir.y, 0.0);
+	// 地平线以下（高空俯视渲染距离外的下方天空）：只返回地平线
+	// 基础色——日月/星光只画在上半球天空。旧版把完整天空画到
+	// 地平线以下 = 高空俯视在"地面以下"看到月亮（"反色月亮"）。
+	// 云层例外：云在世界空间高度带内（205~222），相机在云上时
+	// 俯视应该看到云海——volCloud 的 ray-cloud intersection 对
+	// dir.y < 0 同样成立（tNear/tFar 自动排序），这里照常调用。
+	// 雾混合由调用方（composite1 的 hz×0.45）继续叠加
+	if (dir.y <= 0.0) {
+		vec3 horizonD = mix(vec3(0.012, 0.02, 0.04), vec3(0.66, 0.75, 0.88), df);
+		horizonD *= (1.0 - wetness * 0.55);
+		return volCloud(dir, horizonD, df, cloudLevel, cloudDensity);
+	}
 	// 冷暖色调分离（瑞利散射式）：地平线基础色 = 夜晚深邃冷蓝 → 白天清亮
 	// 蓝白（不含浑浊黄灰）；只有太阳真正低角度时（warm 太阳倾斜因子，
 	// 正午≈0、深夜门控归零）才叠加橙黄→淡粉的散射暖色
@@ -160,6 +285,9 @@ vec3 overworldSky(vec3 dir, float stars, float sunGlow, float sunSize, float moo
 	sky += moonDetail(dir, moonSize * 0.0566);
 	// 星光（避开日月盘面；月亮角半径按当前 MOON_SIZE）
 	sky += starField(dir, stars * (1.0 - df) * 1.4, starDensity, moonSize * 0.0566);
+	// 简单体积云（在日月星光之后混合——云浓时遮日/月；
+	// cloudLevel=0 时 volCloud 直接返回 skyCol，零开销）
+	sky = volCloud(dir, sky, df, cloudLevel, cloudDensity);
 	return sky;
 }
 
@@ -221,7 +349,7 @@ vec3 endSky(vec3 dir, float stars, float starDensity) {
 }
 
 // ===== 总入口 =====
-vec3 getSkyColor(vec3 dir, float stars, float sunGlow, float sunSize, float moonSize, float starDensity) {
+vec3 getSkyColor(vec3 dir, float stars, float sunGlow, float sunSize, float moonSize, float starDensity, float cloudLevel, float cloudDensity) {
 	// 实验：强制主世界天空（排查维度检测误判）
-	return overworldSky(dir, stars, sunGlow, sunSize, moonSize, starDensity);
+	return overworldSky(dir, stars, sunGlow, sunSize, moonSize, starDensity, cloudLevel, cloudDensity);
 }
