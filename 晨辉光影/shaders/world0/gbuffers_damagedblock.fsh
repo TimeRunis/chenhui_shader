@@ -1,5 +1,5 @@
 #version 450 compatibility
-/* RENDERTARGETS: 0,1,2 */
+/* RENDERTARGETS: 0,1,2,3 */
 // 地形主通道：PBR（LabPBR）+ 动态光源标记
 // 基础顶点格式（兼容 Iris 1.7 全部地形阶段），细节法线用近似扰动
 
@@ -44,7 +44,10 @@ uniform float alphaTestRef;
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 2) out vec4 fragOut2;
+layout(location = 3) out float depthOut; // colortex3 不透明深度（SSR scene depth）
 void main() {
+	// 不透明深度快照：几何深度写入 colortex3（SSR 用；水面/雨/云/粒子/手持等半透明程序不写，水面像素处保留水底/地形深度）
+	depthOut = gl_FragCoord.z;
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
 	vec3 normal = normalize(normalV);

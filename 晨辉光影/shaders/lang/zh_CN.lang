@@ -103,6 +103,17 @@ option.CONTRAST.comment=画面明暗对比度
 option.VIGNETTE=暗角
 option.VIGNETTE.comment=画面四角轻微压暗强度
 
+option.DEBUG_SSR=SSR 调试可视化（临时）
+option.DEBUG_SSR.comment=调试用：1=水面识别 2=ray 在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3 深度快照，0=关闭
+value.DEBUG_SSR.0=关闭
+value.DEBUG_SSR.1=水面识别 mask
+value.DEBUG_SSR.2=ray 在屏内
+value.DEBUG_SSR.3=水面之上候选
+value.DEBUG_SSR.4=最终命中
+value.DEBUG_SSR.5=反射权重
+value.DEBUG_SSR.6=SSR 反射色
+value.DEBUG_SSR.7=colortex3 深度快照
+
 profile.Performance=性能模式
 profile.Balanced=均衡模式
 profile.Extreme=极致模式
