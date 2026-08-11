@@ -10,9 +10,11 @@ in vec4 tint;
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 3) out float depthOut; // colortex3 不透明深度（天空=远平面）
+layout(location = 1) out vec4 fragOut1; // colortex1.b 水面材质标志（非水面 = 0）
 
 void main() {
 	gl_FragDepth = 1.0;
 	depthOut = 1.0;
+	fragOut1 = vec4(0.0, 0.0, 0.0, 1.0); // 非水面：天空也显式清材质标志
 	fragOut0 = gl_Color;
 }

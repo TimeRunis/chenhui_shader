@@ -69,7 +69,7 @@ void main() {
 		float flick = 0.8 + 0.2 * hash1(floor(frameTimeCounter * 12.0) + floor(worldPos.y * 2.0));
 		vec3 color = albedo * (0.55 + 0.85 * flick) + vec3(0.6, 0.2, 0.02) * flick * 3.2;
 		fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
-		fragOut1 = vec4(0.0, 0.0, 0.0, 1.0);
+		fragOut1 = vec4(0.0, 0.0, 0.0, 1.0); // 非水面：岩浆清材质标志（colortex1.b=0）
 		return;
 	}
 
@@ -83,33 +83,42 @@ void main() {
 		vec3 colorP = calcLight(albedo, n, lmcoord, viewDir, worldPos, 0.5, 0.0, 0.0, SHADOW_QUALITY);
 		fragOut0 = vec4(colorP * PRE_EXPOSURE, alpha);
 		fragOut2 = vec4(albedo, 1.0);
-		// 不写水面深度：composite1 的 wd > 0.5 阈值排除，海带不参与 SSR
+		// 不写水面深度/材质标志：海带不是水面（colortex1 = 0，SSR 不参与；
+		// a=1 保证 blend 下也把背景水面标志清掉）
 		fragOut1 = vec4(0.0, 0.0, 0.0, 1.0);
 		return;
 	}
 
+	// 水面：不使用原版水纹理材质——水面颜色由光影程序化控制
+	// （亮蓝基础色；光照/波纹/反射/波光全部来自光影本身。
+	// 0.30/0.50/0.62 的 B/G=1.24 偏绿——暗部观感"深绿"（用户
+	// 反馈：平视全深绿）；0.30/0.48/0.72 的 B/G=1.5 明显更蓝，
+	// 亮度保持原级，平视/俯视的水色都呈蓝调）
+	albedo = vec3(0.30, 0.48, 0.72);
 	// 水面：波浪法线（与 composite1 的 SSR 共用同一函数）。
 	// 振幅系数 0.9（0.35→0.6→0.9：所有水面的波纹都要可见，
 	// 不只是 SSR 反射区域——波浪法线倾斜让水面明暗与高光
-	// 波纹遍布整片水面；大波(0.11)/细波(0.33)两层噪声）
+	// 波纹遍布整片水面；密度对齐 Derivative Main 4 层高频波）
 	float amp = (WAVE_AMOUNT / 100.0) * 0.9 * (1.0 + wetness * 1.2);
 	vec3 wn = waterNormalWorld(worldPos, amp);
 	n = normalize(mat3(gbufferModelView) * wn);
 
-	// 水面反射率：白天 ×0.4（深蓝，不再发白/压水底），夜晚 ×0.6
-	// （天光弱时保留蓝调轮廓，避免水面全黑）。
-	// df 是 calcLight 的局部变量，这里需自己取白天系数
+	// 水面基础色不再压暗（旧版 ×0.4 是"反射率"设计残留：程序水色
+	// 时代它把白天水面压回 (0.12,0.20,0.25) 暗色 = "发黑/深绿"根因
+	// 之一）。水面颜色 = 程序水色 × 光照，夜晚由天光自然压暗
 	float df = dayFactorF();
-	vec3 color = calcLight(albedo * mix(0.6, 0.4, df), n, lmcoord, viewDir, worldPos, 0.92, 0.0, 0.0, SHADOW_QUALITY);
+	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, 0.92, 0.0, 0.0, SHADOW_QUALITY);
 
 	// 水面透明度写入 alpha = 0.65（原版水面纹理级别）——恢复真实
 	// 水面的半透明状，透出 35% 水底材质：浅水区能看清水底颜色，
 	// 深水区透出的仍是远处水底（暗）。SSR 已排除水下命中，水底
-	// 只经透射显示，不再被误反射泛白（composite1 识别阈值同步 0.65）
+	// 只经透射显示，不再被误反射泛白
 	fragOut0 = vec4(color * PRE_EXPOSURE, 0.65);
 	fragOut2 = vec4(albedo, 1.0);
-	// 水面片元深度（非线性 d）写入 colortex1：composite1 的 SSR 用它
-	// 重建反射起点——depthtex0 在半透明水面处是水底/天空的深度，
-	// 不能用于水面反射起点（用了会错位/负片，见 composite1 注释）
-	fragOut1 = vec4(gl_FragCoord.z, 0.0, 0.0, 1.0);
+	// 水面深度 + 材质标志写入 colortex1：
+	// r = 水面片元深度（非线性 d，composite1 的 SSR 用它重建反射起点
+	// ——depthtex0 在半透明水面处是水底/天空的深度，不能用于水面
+	// 反射起点）；b = 1.0 水面材质标志（composite1 的 SSR 用它识别
+	// 水面；其余所有 gbuffers 程序显式写 0，a=1 保证 blend 下覆盖）
+	fragOut1 = vec4(gl_FragCoord.z, 0.0, 1.0, 1.0);
 }

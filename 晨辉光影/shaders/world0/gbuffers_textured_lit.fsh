@@ -39,6 +39,7 @@ uniform float alphaTestRef;
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 2) out vec4 fragOut2;
+layout(location = 1) out vec4 fragOut1; // colortex1.b 水面材质标志（非水面 = 0）
 void main() {
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
@@ -56,4 +57,5 @@ void main() {
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, 0.1, 0.0, 0.0, SHADOW_QUALITY);
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 	fragOut2 = vec4(albedo, 1.0);
+	fragOut1 = vec4(0.0, 0.0, 0.0, 1.0); // 非水面：显式清材质标志（a=1 保证 blend 下也覆盖）
 }

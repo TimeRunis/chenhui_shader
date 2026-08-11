@@ -24,7 +24,7 @@ in vec2 texcoord;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
-#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7] (1=水面识别 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照)
+#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图)
 
 // colortex0（gbuffers 主颜色 + alpha 方块光等级）用半浮点：
 // RGBA8 下 PRE_EXPOSURE 0.62 把漫反射量化精度砍掉 40%，圆石细颗粒
@@ -34,10 +34,13 @@ in vec2 texcoord;
 // 裸声明在 Iris 1.7 会原样进入 GLSL 编译（RGBA16F 未定义 → C1503）
 /*
 const int colortex0Format = RGBA16F;
-// 水面深度存 colortex1（gbuffers_water 写 gl_FragCoord.z 非线性深度）。
-// 16F 在 1.0 附近精度 ~2^-11：远处水面（深水区）d≈0.995+ 量化误差经
-// linDepth 反推放大到数格~上百格 → 反射起点 vp 错位 → 深水区 SSR
-// 命中判定失效 = "深水反射消失"。32F 精度 2^-24 → 远处误差 < 0.01 格
+// 水面深度 + 水面材质标志存 colortex1（gbuffers_water 写）：
+// r = 水面片元深度（gl_FragCoord.z 非线性，32F 精度 2^-24 → 远处
+// 误差 < 0.01 格；16F 在 1.0 附近精度 ~2^-11，远处水面 d≈0.995+
+// 量化误差经 linDepth 反推放大到数格~上百格 → 反射起点 vp 错位
+// = "深水反射消失"）；
+// b = 水面材质标志（1 = 水面，0 = 其余——所有 gbuffers 程序显式
+// 写，不依赖 buffer 清零；写 a=1 保证 blend 程序下也确定性覆盖）
 const int colortex1Format = RGBA32F;
 const int colortex2Format = RGBA16F;
 // 不透明深度快照（composite1 的 SSR scene depth）：
@@ -86,6 +89,9 @@ void main() {
 	float dbgSsrHit = 0.0;    // rayHit：最终命中（穿越+高度过滤+未出屏）
 	float dbgSsrW = 0.0;      // reflectionWeight：最终反射混合权重
 	vec3 dbgSsrCol = vec3(0.0); // SSR 反射色（线性域）
+	float dbgSsrMiss = 0.0; // SSR miss（无任何命中 → 弱环境 fallback）
+	float dbgWd = 0.0;    // 水面深度门禁值（colortex1.r，debug 1/9 用）
+	float dbgWFlag = 0.0; // 水面材质标志门禁值（colortex1.b，debug 1/9 用）
 	// 天空判定（双保险）：深度≈1 且（距离达到投影远平面 98% 或超过雾端）。
 	// 只靠 d>0.9995 会把渲染距离边缘的远处方块（深度同样≈1）误判成天空、
 	// 刷成天幕色 → "方块被裁剪"；两个距离条件任一成立即天空，对 fogEnd 异常也健壮
@@ -235,23 +241,29 @@ void main() {
 	// 未命中/出屏回退天空色（与主天空同一函数同一雾混合），
 	// 命中点再按距离补雾——远岸山体反射不会突兀清晰
 	{
-		float aB = texture(gcolor, texcoord).a;
 		// 眼睛在水下时不做 SSR：水下抬头视线从下往上穿过水面，
 		// 反射方向 R=reflect(viewDir,nV) 朝下回到水里——SSR 会在
 		// 水下找"反射内容"（物理错误：水下看水面是透射看天空，
 		// 不是反射）。跳过 SSR 后水面显示 gcolor 混合内容
 		// （水色×0.65 + 35% 透过的水下景物/天空）
-		if (aB > 0.63 && aB < 0.67 && WATER_REFLECT > 0 && isEyeInWater < 0.5) {
-			dbgSsrWater = 1.0;
-			// 水面深度从 colortex1（gbuffers_water 写入）取：32F 精确存储
-			// 水面片元深度，不依赖 Iris 深度缓冲语义。depthtex0 虽也
-			// 含半透明水面（Iris：depthtex0=全部几何），但重建起点用
-			// colortex1 与 scene depth 采样（depthtex1=不透明）完全解耦，
-			// 且 32F 比 24 位深度缓冲更精确。其他像素 colortex1 未写
-			// （0），阈值 0.5 排除
-			float wd = texture(colortex1, texcoord).r;
-			if (wd > 0.5) {
-			float d = wd;
+		// 水面识别（v3 材质标志）：colortex1.b = 水面材质标志——
+		// gbuffers_water 显式写 1.0，其余所有 gbuffers 程序显式写
+		// 0.0（写 a=1 保证 blend 程序下也确定性覆盖）。不再用
+		// gcolor.a=0.65 数值巧合（与方块光等级解耦），不依赖
+		// colortex1 每帧清零。三重门禁：
+		// ① 材质标志 = 1（唯一的水面身份来源）
+		// ② colortex1.r = 水面深度 > 0.05（深度有效——排除未写入
+		//    的 0；旧阈值 0.5 = 距离 0.2 块，眼睛贴水（游泳/蹲水里）
+		//    低头时最近的水面像素距离 < 0.2 块被整片排除 = "低头到
+		//    某角度水面变原版 + debug 5 全黑"的根因）
+		// ③ depthtex0 与该深度一致（水面像素的最前深度必然等于
+		//    水面深度本身——覆盖/blend 造成的 stale 标志残留像素
+		//    （手持透明物品等）过不了这一关）
+		if (WATER_REFLECT > 0 && isEyeInWater < 0.5) {
+			dbgWd = texture(colortex1, texcoord).r;
+			dbgWFlag = texture(colortex1, texcoord).b;
+			if (dbgWd > 0.05 && dbgWFlag > 0.5 && abs(texture(depthtex0, texcoord).r - dbgWd) < 0.001) {
+			float d = dbgWd;
 			vec3 vp = viewPosFromDepth(d, texcoord);
 			vec3 viewDir = normalize(vp);
 			// 水面像素世界位置：SSR 命中排除水下物体用（命中点世界
@@ -265,24 +277,20 @@ void main() {
 					(WAVE_AMOUNT / 100.0) * 0.9 * (1.0 + wetness * 1.2)));
 			vec3 R = reflect(viewDir, nV);
 			// 不限制反射方向：平视/微俯看远处水面时反射方向朝上
-			// （反射天空、远岸山体）——这是水面反射最常见的场景，
-			// 之前限定 R.y<−0.05 把它全部排除 = 用户看到"几乎原版水"
-			// 的根因。方块光 13 级误判已由 4 邻居 alpha 一致性排除
+			// （反射天空、远岸山体）——这是水面反射最常见的场景。
+			// 水面身份由 colortex1.b 材质标志唯一确定，不再需要
+			// 4 邻居 alpha 一致性启发式（它曾在岸边把最浅一圈
+			// 水面排除出 SSR = 1px mask 内缩，随启发式一起移除）
 			{
-				vec2 pxR = vec2(1.0 / viewWidth, 1.0 / viewHeight);
-				float aN = 0.0;
-				aN += abs(texture(gcolor, texcoord + vec2(pxR.x, 0.0)).a - 0.65);
-				aN += abs(texture(gcolor, texcoord - vec2(pxR.x, 0.0)).a - 0.65);
-				aN += abs(texture(gcolor, texcoord + vec2(0.0, pxR.y)).a - 0.65);
-				aN += abs(texture(gcolor, texcoord - vec2(0.0, pxR.y)).a - 0.65);
-				if (aN < 0.1) {
 					vec3 Rn = normalize(R);
 					vec3 Rw = normalize(mat3(gbufferModelViewInverse) * Rn);
-					// 反射天空（回退）：与主天空同参数同雾混合——
-					// 地平线方向混雾色，反射的天际线不出现亮白带
-					vec3 refl = getSkyColor(Rw, STARS / 100.0, SUN_GLOW / 100.0, SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0, float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
+					// 环境弱 fallback（仅 SSR miss 时用，8% 强度）：与主
+					// 天空同参数同雾混合。任何 miss（出屏/无交点/走满
+					// 步数/饱和路径无可靠交点）都不允许把天空当等价
+					// 反射以 Fresnel 全权重混入（SSR-2）
+					vec3 envWeak = getSkyColor(Rw, STARS / 100.0, SUN_GLOW / 100.0, SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0, float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
 					float hzR = pow(max(1.0 - Rw.y, 0.0), 2.5);
-					refl = mix(refl, fogC, hzR * 0.45);
+					envWeak = mix(envWeak, fogC, hzR * 0.45);
 					// 光线步进：屏幕空间 marching（参照 Derivative Main 的
 					// ScreenSpaceRayTrace）。坐标：rayPos.xy=像素坐标、
 					// rayPos.z=非线性深度(0~1,大=远)。scene depth 取自
@@ -294,23 +302,26 @@ void main() {
 					// 参数；命中 = 场景深度 < 射线深度 且线性相对差 <20%
 					// （防大步长远处误命中薄表面）。出屏/深度超界 = miss
 					// （回退按反射方向的天空）
-					int steps = (WATER_REFLECT > 1) ? 24 : 16;
-					// 屏幕空间反射方向：起点水面像素 → 反射方向远点
-					vec4 tarClip = gbufferProjection * vec4(vp + R * abs(vp.z), 1.0);
+					int steps = (WATER_REFLECT > 1) ? 32 : 24; // 步数提高：扩大 marching 屏幕覆盖范围
+					// 屏幕空间反射方向：起点水面像素 → 反射方向远点。
+					// 最小延伸 4 块：眼睛贴水时 |vp.z| 可小到 0.1，
+					// target 过近 → screenDir 退化为零向量（NaN）
+					vec4 tarClip = gbufferProjection * vec4(vp + R * max(abs(vp.z), 4.0), 1.0);
 					vec3 target = vec3(tarClip.xy / tarClip.w * 0.5 + 0.5,
 						tarClip.z / tarClip.w * 0.5 + 0.5) * vec3(viewWidth, viewHeight, 1.0);
-					vec3 screenDir = normalize(target - vec3(gl_FragCoord.xy, wd));
+					vec3 screenDir = normalize(target - vec3(gl_FragCoord.xy, dbgWd));
 					float stepWeight = 1.0 / max(abs(screenDir.z), 1e-5);
 					// 像素空间步长钳制（Derivative 在 UV 空间 clamp，转像素
 					// 后等价）：minLength=1px、maxLength=屏长/步数
 					float maxLength = max(viewWidth, viewHeight) / float(steps);
 					float minLength = 1.0; // 1 像素
 					vec3 acc = vec3(0.0);
+					int hitCount = 0; // SSR 命中遍数（miss 判定与命中平均用）
 					for (int k = 0; k < ((WATER_REFLECT > 1) ? 2 : 1); k++) {
-						vec3 col = refl;
+						vec3 col = vec3(0.0); // 本遍命中色（miss 保持 0，不再初始化成天空）
 						// 起点 = 水面像素（像素坐标 + 非线性深度）；高档第 2
 						// 遍相位抖动（±3 像素）→ 波纹亚步长模糊
-						vec3 rayPos = vec3(gl_FragCoord.xy, wd);
+						vec3 rayPos = vec3(gl_FragCoord.xy, dbgWd);
 						if (k == 1) rayPos += screenDir * 3.0;
 						// 第一跳：跨到屏幕边界的步长/步数（防止第一步跳出
 						// 屏幕），起点额外推进 dither×步长 + 1 像素
@@ -420,22 +431,42 @@ void main() {
 								}
 							}
 						}
-						acc += col;
+						if (dbgSsrHit > 0.5) { acc += col; hitCount++; } // 只累计命中遍（miss 遍不稀释）
+						dbgSsrHit = 0.0; // 逐遍清零，避免上一遍命中污染下一遍判定
 					}
-					refl = acc / float((WATER_REFLECT > 1) ? 2 : 1);
+					// SSR hit/miss 分离（SSR-2）：
+					vec3 refl;
+					if (hitCount > 0) {
+						// HIT：命中色平均（miss 遍不稀释），Fresnel 权重不变
+						refl = acc / float(hitCount);
+					} else {
+						// MISS 分级（SSR-2 修订）：
+						// 反射方向明显朝天（Rw.y > 0.35 = 低头看水面）时，
+						// 天空是物理正确的反射内容——俯视水面的倒影就是
+						// 头顶天空（天顶色暗，不像地平线亮雾带刺眼），给
+						// 可见强度（最高 0.45，随 Rw.y 渐变）：低头时反射
+						// 不"消失"，水面持续有反射内容（debug 4 置位）。
+						// 接近地平线（Rw.y ≤ 0.35 = 平视深水）时压到极弱
+						// （0.05~0.12）——旧版"深水天空镜面"的刺眼来源
+						float missK;
+						if (Rw.y > 0.35) {
+							missK = 0.45 * smoothstep(0.35, 0.7, Rw.y);
+						} else {
+							missK = mix(0.05, 0.12, clamp(Rw.y, 0.0, 1.0));
+						}
+						refl = mix(color, envWeak, missK);
+					}
+					// debug 语义：hit = 有反射内容（几何命中或俯视天空
+					// 反射），miss = 无内容（弱 fallback）
+					dbgSsrHit = (hitCount > 0 || Rw.y > 0.35) ? 1.0 : 0.0;
+					dbgSsrMiss = (hitCount == 0 && Rw.y <= 0.35) ? 1.0 : 0.0;
 					dbgSsrCol = refl;
 					// 菲涅尔反射率：俯视 0.45、掠射 0.9（用户选择增强——
 					// 俯视时附近方块/光源/日月反射明显可见，掠射近全反射）
 					float reflK = 0.45 + 0.45 * pow(1.0 - dot(-viewDir, nV), 3.0);
-					// 未命中（ray 走满步数或出屏）时保留完整反射权重：
-					// 反射内容 = 按世界空间反射方向 Rw 采样的天空
-					// （getSkyColor，与命中反射是同一水面的两个内容来源）。
-					// 物理：水面反射率由菲涅尔决定，与前方是否有几何无关
-					// ——前方没有几何就反射天空（深水区倒映天空、浅水区
-					// 倒映岸边）。旧版 0.35 折扣让深水区天空倒影几乎不可
-					// 见 = "只有一部分水面有反射"的观感 = 本次需求：整个
-					// 水面都进行屏幕空间反射。浅水泛白已不存在：水底命中
-					// 已被高度判据排除，浅水区反射的是岸边景物而非亮水底
+					// Fresnel 权重（本轮保持原值，SSR-3 再重构）：
+					// 俯视 0.45、掠射 0.9。miss 时反射内容已是弱 fallback，
+					// 权重不再决定"天空镜面"强度
 					dbgSsrW = reflK;
 					color = mix(color, refl, reflK);
 					// 波光粼粼（太阳镜面高光）独立叠加：所有水面像素都有
@@ -444,7 +475,6 @@ void main() {
 					vec3 sunSpec = vec3(1.0, 0.8, 0.55)
 						* pow(max(dot(Rn, sunDirV()), 0.0), 350.0) * (0.15 + 0.85 * dfFog);
 					color += sunSpec * mix(0.5, 1.0, reflK);
-				}
 			}
 			}
 		}
@@ -478,7 +508,9 @@ void main() {
 		// 的面积 ≈ 半径 11 格圆）。中心亮度按等级映射：火把 0.93、
 		// 萤石 1.0，与放置光源中心一致
 		float rad = heldLight * 0.8 + 0.5;
-		float hatt = clamp((rad - hd) / rad, 0.0, 1.0);
+		// 光衰减改 smoothstep（旧 clamp 线性衰减的边缘导数不连续：
+		// 深度重建噪声让 hd 在光斑边缘抖动 → 亮度硬边闪烁）
+		float hatt = 1.0 - smoothstep(0.0, rad, hd);
 		hatt *= heldLight / 15.0;
 		// 白天衰减：环境光强时手持光被淹没（放置火把白天同样不显）
 		float dayW = mix(1.0, 0.35, dfFog);
@@ -493,7 +525,8 @@ void main() {
 			for (int j = -3; j <= 3; j++) {
 				vec2 off = vec2(0.75, 0.28) + vec2(float(i), float(j)) * viewHeight * 0.025 * px;
 				if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
-				vec3 lc = texture(colortex1, off).rgb;
+				vec4 c1x = texture(colortex1, off);
+			vec3 lc = vec3(c1x.r, c1x.g, c1x.a); // r/g/a = 手持物品 albedo×等级（b = 水面材质标志，不入采样）
 				float w = max(min(lc.r, min(lc.g, lc.b)) - 0.1, 0.0);
 				lsum += lc * w;
 				wsum += w;
@@ -504,19 +537,30 @@ void main() {
 			lcol = lsum / wsum;
 			lcol = lcol / max(max(lcol.r, lcol.g), max(lcol.b, 1e-4));
 			// 色相钳制在暖白~橙带内（g∈[0.72,0.98]、b∈[0.35,0.90]），
-			// 再向暖白收敛 40%：火焰动画帧/采样抖动造成的色相漂移被
-			// 压掉，不偶发变红；火把橙、萤石白、海晶灯蓝白仍在带内
+			// 再向暖白收敛 70%：火焰动画帧/物品摆动让采样区域内容
+			// 逐帧变化 → lcol 抖动 → 光照闪烁；更强收敛压掉抖动，
+			// 火把橙/萤石白/海晶灯蓝白的差异仍可辨
 			lcol = vec3(1.0, clamp(lcol.g, 0.72, 0.98), clamp(lcol.b, 0.35, 0.90));
-			lcol = mix(vec3(1.0, 0.85, 0.6), lcol, 0.6);
+			lcol = mix(vec3(1.0, 0.85, 0.6), lcol, 0.3);
 		}
-		// 材质响应：gbuffers 写入的 albedo（colortex2），与放置光源同构
-		vec3 albedo = texture(colortex2, texcoord).rgb;
 		float hK = LIGHT_GLOW / 100.0;
-		// 与场景光取 max（原版 lightmap 语义：亮度 = max(天光, 方块光)）：
-		// 手持光不叠加在其他光源之上——火把旁再持火把不会过曝；
-		// 远处/白天场景光胜出，手持光自然退场
-		color = max(color, lcol * hatt * hK * dayW * albedo * (1.0 - bodyK));
-		color *= 1.0 + 0.7 * hK * dayW * bodyK;
+		// 水面像素（colortex1.b 材质标志）：手持光弱加法提亮——
+		// 不 max 覆盖（否则程序水色×albedo = 绿色纯平光罩，盖掉
+		// 半透明水底透出与 SSR 反射内容）、不乘 albedo（程序水色
+		// 青蓝 × 暖光 = 偏绿）。水面本身的受光由 gbuffers_water
+		// calcLight 与 SSR 反射负责
+		float wFlagH = texture(colortex1, texcoord).b;
+		if (wFlagH > 0.5) {
+			color += lcol * hatt * hK * dayW * 0.35 * (1.0 - bodyK);
+		} else {
+			// 材质响应：gbuffers 写入的 albedo（colortex2），与放置光源同构
+			vec3 albedo = texture(colortex2, texcoord).rgb;
+			// 与场景光取 max（原版 lightmap 语义：亮度 = max(天光, 方块光)）：
+			// 手持光不叠加在其他光源之上——火把旁再持火把不会过曝；
+			// 远处/白天场景光胜出，手持光自然退场
+			color = max(color, lcol * hatt * hK * dayW * albedo * (1.0 - bodyK));
+			color *= 1.0 + 0.7 * hK * dayW * bodyK;
+		}
 	}
 	// HDR 软压缩（保色度）：diffuse ≤ 1.0（原版 lightmap 上限）线性保留，
 	// 光斑亮度递减与纹理对比度原样映射；仅对 HDR 超限（太阳直射 ~1.4、
@@ -543,11 +587,23 @@ void main() {
 	// 变成 (1.0, 0.33, 0.09) 纯橙红、纹理被 clamp 压平（"萤石材质
 	// 不明显"）。直出 = 三分屏中段（直通）观感
 	// ===== SSR 调试可视化（临时，DEBUG_SSR=0 时编译期消除） =====
-	// 1=waterMask（水面识别） 2=screenValid（ray 在屏内）
-	// 3=hitCandidate（深度穿越候选，不含高度过滤） 4=rayHit（最终命中）
-	// 5=reflectionWeight（最终反射权重 0~1） 6=SSR 反射色（线性域）
-	if (DEBUG_SSR == 1) color = vec3(dbgSsrWater);
-	else if (DEBUG_SSR == 2) color = vec3(dbgSsrScreen);
+	// 1=门禁分解（R:材质标志 G:深度有效 B:深度一致，白=水面）
+	// 2=screenValid（ray 在屏内） 3=hitCandidate（深度穿越候选）
+	// 4=rayHit（最终命中） 5=reflectionWeight（反射权重 0~1）
+	// 6=SSR 反射色（线性域） 7=colortex3 深度快照
+	// 8=SSR miss（水面无任何命中 = 弱 fallback） 9=colortex1 直显
+	// 10=colortex2 albedo 直显（水下水面程序归属诊断）
+	if (DEBUG_SSR == 1) {
+		// 门禁分解：R = 材质标志（colortex1.b，水面应=1 → 红亮）
+		//           G = 水面深度有效（colortex1.r > 0.5 → 绿亮）
+		//           B = depthtex0 与 colortex1.r 深度一致（→ 蓝亮）
+		// 白 = 三重门禁全过（真正水面）；黑 = 非水面像素
+		// （全黑且无红/绿/蓝 = 水面像素一个门禁都没过，见 debug 9）
+		float m1 = (dbgWFlag > 0.5) ? 1.0 : 0.0;
+		float m2 = (dbgWd > 0.05) ? 1.0 : 0.0;
+		float m3 = (abs(texture(depthtex0, texcoord).r - dbgWd) < 0.001) ? 1.0 : 0.0;
+		color = vec3(m1, m2, m3);
+	} else if (DEBUG_SSR == 2) color = vec3(dbgSsrScreen);
 	else if (DEBUG_SSR == 3) color = vec3(dbgSsrCand);
 	else if (DEBUG_SSR == 4) color = vec3(dbgSsrHit);
 	else if (DEBUG_SSR == 5) color = vec3(dbgSsrW);
@@ -557,6 +613,26 @@ void main() {
 		// 诊断期 skybasic 写 0.5（天空应=中灰）；地形深度 <1 偏白。
 		// 全黑 = gbuffers 写 colortex3 完全未生效
 		color = vec3(texture(colortex3, texcoord).r);
+	} else if (DEBUG_SSR == 8) {
+		// SSR miss：水面像素无任何命中 = 1（弱环境 fallback），
+		// 命中 = 0；非水面像素恒为 0（只有水面能进入 SSR）
+		color = vec3(dbgSsrMiss);
+	} else if (DEBUG_SSR == 9) {
+		// 诊断：colortex1 直显——R = b 通道（水面材质标志，水面应
+		// =1 纯红）、G = r 通道（水面深度灰度，远处偏亮）。水面
+		// 像素若为黑 = gbuffers_water 写 colortex1 完全未生效
+		color = vec3(texture(colortex1, texcoord).b, texture(colortex1, texcoord).r, 0.0);
+	} else if (DEBUG_SSR == 11) {
+		// 诊断：shadowtex0 直显（阴影图灰度，近太阳亮/远太阳暗）。
+		// 全白/全黑 = shadow pass 未渲染几何（阴影图空）；有明暗
+		// 层次 = 阴影图正常（问题在 shadowSample 或强度）
+		color = vec3(texture(shadowtex0, texcoord).r);
+	} else if (DEBUG_SSR == 10) {
+		// 诊断：colortex2 直显（gbuffers 写入的 albedo 灰度）。
+		// 水下视角看水面：水面区域若为亮色（原版水纹理色）=
+		// 该渲染走了带纹理采样的程序（非 gbuffers_water 程序色
+		// 0.30/0.50/0.62，灰度 ≈0.44）
+		color = vec3(texture(colortex2, texcoord).r);
 	}
 	fragOut0 = vec4(color, 1.0);
 }

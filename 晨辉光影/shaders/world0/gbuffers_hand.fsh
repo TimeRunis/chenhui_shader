@@ -73,9 +73,11 @@ void main() {
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 	fragOut2 = vec4(albedo, 1.0);
-	// 手持光源材质色写入 colortex1（composite1 物品区域采样取光源色）：
-	// 物品像素写 albedo×等级与等级——火把=暖橙、萤石=白、灯笼=橙、
-	// 海晶灯=蓝白，随手持物品变化；非光源物品写 0
+	// 手持光源材质色写入 colortex1（composite1 物品区域采样取光源色，
+	// 采样用 .rga 通道）：r/g/a = albedo×等级——火把=暖橙、萤石=白、
+	// 灯笼=橙、海晶灯=蓝白，随手持物品变化；非光源物品写 0。
+	// b = 0 显式清水面材质标志（手持物品不是水面；colortex1.b=1 只
+	// 由 gbuffers_water 写，见 composite1 注释）
 	float handLvl = max(float(heldBlockLightValue), float(heldBlockLightValue2));
-	fragOut1 = vec4(albedo * clamp(handLvl, 0.0, 1.0), clamp(handLvl, 0.0, 1.0));
+	fragOut1 = vec4(albedo.rg * clamp(handLvl, 0.0, 1.0), 0.0, albedo.b * clamp(handLvl, 0.0, 1.0));
 }

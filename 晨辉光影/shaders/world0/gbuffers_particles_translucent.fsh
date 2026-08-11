@@ -63,11 +63,13 @@ uniform float alphaTestRef;
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 3) out float depthOut; // colortex3 粒子深度（composite 区分粒子与天空用）
+layout(location = 1) out vec4 fragOut1; // colortex1.b 水面材质标志（非水面 = 0）
 
 void main() {
 	vec4 albedo4 = texture(texture, texcoord) * tint;
 	if (albedo4.a < alphaTestRef) discard;
 	depthOut = gl_FragCoord.z;
+	fragOut1 = vec4(0.0, 0.0, 0.0, 1.0); // 非水面：粒子显式清材质标志（a=1 保证 blend 下也覆盖）
 
 	// 原版粒子观感：albedo × lightmap 显示亮度（r = max(天光, 方块光)）。
 	// clamp 到格中心范围（同 calcLight 的 lmMin/lmMax，避免采样到
