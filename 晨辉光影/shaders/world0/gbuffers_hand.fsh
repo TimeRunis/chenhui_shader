@@ -35,6 +35,8 @@ in vec3 normalV;
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
 
 #include "/lib/common.fsh"
+#include "/lib/noise.glsl"
+#include "/lib/sky.glsl"
 uniform float alphaTestRef;
 
 // Iris 支持的 OptiFine 兼容 uniform：主手/副手手持方块的光照等级
@@ -71,6 +73,15 @@ void main() {
 		smoothness = min(smoothness, 0.15);
 	}
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
+	// PBR 环境反射（金属/光滑表面反射天空穹顶——近似环境反射）：
+	// 反射方向 = 视线关于法线的镜像（世界空间），采样程序化天空
+	// （传 cloudLevel=0：云不参与反射且零开销）。强度 = smoothness
+	// × 金属系数——LabPBR 光滑/金属方块有明显环境反射，哑光微弱
+	if (smoothness > 0.1) {
+		vec3 rvN = normalize(mat3(gbufferModelViewInverse) * reflect(viewDir, n));
+		vec3 skyRefl = getSkyColor(rvN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+		color += skyRefl * smoothness * mix(0.12, 0.45, metal);
+	}
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 	fragOut2 = vec4(albedo, 1.0);
 	// 手持光源材质色写入 colortex1（composite1 物品区域采样取光源色，

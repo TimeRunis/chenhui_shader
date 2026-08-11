@@ -101,6 +101,17 @@ void main() {
 	// 波纹遍布整片水面；密度对齐 Derivative Main 4 层高频波）
 	float amp = (WAVE_AMOUNT / 100.0) * 0.9 * (1.0 + wetness * 1.2);
 	vec3 wn = waterNormalWorld(worldPos, amp);
+	// 雨打水面（参考 Derivative Main RainEffect.glsl 的雨法线扰动）：
+	// 湿天水面叠加高频快速变化的雨纹——雨点落下产生细碎波纹，
+	// 水面法线高频抖动（波纹更碎、反射与波光破碎闪烁）
+	if (wetness > 0.02) {
+		float t = frameTimeCounter * 6.0;
+		vec2 rq = worldPos.xz * 1.2 + vec2(t * 0.4, t * 0.3);
+		float rn = noise2(rq) + 0.5 * noise2(rq * 2.3 - vec2(t * 0.6, 0.0));
+		// 扰动幅度随雨量（wetness），两层噪声叠加高频雨纹
+		vec3 rp = vec3((rn - 0.75) * 1.6 * wetness, 1.0, (rn - 0.75) * 1.6 * wetness);
+		wn = normalize(wn + rp * 0.8);
+	}
 	n = normalize(mat3(gbufferModelView) * wn);
 
 	// 水面基础色不再压暗（旧版 ×0.4 是"反射率"设计残留：程序水色

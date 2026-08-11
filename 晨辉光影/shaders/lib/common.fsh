@@ -26,6 +26,7 @@ uniform int worldTime;
 
 uniform sampler2D lightmap;
 uniform sampler2D shadowtex0;
+uniform sampler2DShadow shadowtex1; // Iris 硬件深度比较纹理（Derivative 同款用法）
 
 // 预曝光系数：gbuffers 输出 colortex0（RGBA16F，半浮点，见 composite1 的
 // colortex0Format 声明）。16F 精度 ~0.0005，0~1 漫反射与 HDR 高光（萤石
@@ -80,38 +81,48 @@ float dayFactorF() {
 }
 
 // ===== 阴影采样 =====
-// 深度约定（与 OptiFine 阴影相机一致）：深度小 = 更靠近太阳；
-// 采样深度 + 偏差 < 当前深度 -> 处于阴影中。
+// 深度约定（debug 13/14 数据定论）：
+// shadowtex0 = gl_FragCoord.z 直接输出 = 标准深度（近=0 远=1）；
+// shadowProjection 输出反向 NDC（近=1）→ p.z 需转标准再比较。
+// 受光：d + bias > 1.0 - p.z（d ≈ 1-p.z 容差内受光；遮挡物更近
+// = d 更小 → 判阴影）。shadowtex1 硬件比较实测恒受光（方向不可
+// 控），回到手动比较 shadowtex0。
 // taps: 0=无阴影 1=单采样 2=2x2 PCF
 // n: 表面法线（眼空间），用于斜率偏移（slope scale bias）——
 // 表面与阳光方向掠射（法线⊥光线）时自阴影误差最大，
 // 偏移必须随之增大，否则斜坡/墙面交界出现阴影痤疮（"脏泥巴"边缘）
 float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	if (taps <= 0) return 1.0;
-	vec4 sp = shadowProjection * shadowModelView * vec4(worldPos, 1.0);
+	// Iris 的 shadowModelView 接收"相对主相机"坐标（Derivative
+	// deferred5: worldPos = mat3(gbufferModelViewInverse)×viewPos，
+	// 不含 cameraPosition）——传相对坐标，否则偏移 cameraPosition
+	// 导致投影全部越界（debug 15 青色 = 全受光的根因）
+	vec4 sp = shadowProjection * shadowModelView * vec4(worldPos - cameraPosition, 1.0);
 	if (sp.w <= 0.0) return 1.0;
 	vec3 p = sp.xyz / sp.w * 0.5 + 0.5;
-	if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0 || p.z <= 0.0 || p.z >= 1.0) return 1.0;
-	// 深度偏移 = 基础 0.0015 + 斜率偏移 0.004×(1-法线·光线)。
-	// shadowDistance=96 → 深度 1.0 = 96 方块，0.0015≈0.14 方块、
-	// 最大 0.0055≈0.5 方块——阴影边缘紧贴方块与地面交界线。
-	// 之前 0.003+0.009 最大 ≈1.15 方块，把阴影从底部"拉"出去一大截
+	// 只检查 xy 越界；p.z 不设 [0,1] 限制——Iris 1.7.2 的
+	// shadowProjection 输出反向 NDC（近处 p.z 可达 1.0），
+	// 旧版 p.z >= 1.0 → return 1.0 会把近处全部排除（全受光）
+	if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
+	// 深度偏移 = 基础 0.001 + 斜率偏移 0.003×(1-法线·光线)
 	float slope = 1.0 - clamp(dot(n, sunDirV()), 0.0, 1.0);
-	float bias = 0.0015 + 0.004 * slope;
-	// 阴影图边缘淡出：UV/深度接近边界时阴影权重平滑降到 0，
+	float bias = 0.001 + 0.003 * slope;
+	// 阴影图边缘淡出：UV 接近边界时阴影权重平滑降到 0，
 	// 消除 shadowDistance 边缘"阴影突然消失"的方形硬切
 	vec2 uvFade = smoothstep(0.0, 0.04, p.xy) * smoothstep(1.0, 0.96, p.xy);
-	float zFade = smoothstep(1.0, 0.96, p.z);
-	float fade = uvFade.x * uvFade.y * zFade;
+	float fade = uvFade.x * uvFade.y;
 	float s = 0.0;
 	if (taps >= 2) {
-		// 3x3 PCF：~0.8 texel@1024（原 1.6，减半）——阴影边缘保持
-		// 适度柔化但轮廓清晰锐利，更贴近 MC 硬朗画风且省性能
+		// 3x3 PCF：~0.8 texel@1024——阴影边缘适度柔化但轮廓清晰
 		float e = 0.0008;
 		for (int i = -1; i <= 1; i++) {
 			for (int j = -1; j <= 1; j++) {
 				float d = texture(shadowtex0, p.xy + vec2(float(i), float(j)) * e).r;
-				s += (d + bias > p.z) ? 1.0 : 0.0;
+				// 标准深度约定（近=0 远=1，坐标修复后实测 p.z 标准域、
+				// 与 shadow 图同域）：受光 d + bias > p.z（d≈p.z 容差
+				// 内）；阴影 d < p.z（遮挡物更近 = 深度更小）。
+				// clear 空值（d > 0.995 = 内容区外）视为无遮挡受光
+				s += (d > 0.995 || d + bias > p.z) ? 1.0 : 0.0;
 			}
 		}
 		s *= 1.0 / 9.0;
@@ -122,10 +133,10 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 		float d10 = texture(shadowtex0, p.xy + vec2(-e,  e)).r;
 		float d01 = texture(shadowtex0, p.xy + vec2( e, -e)).r;
 		float d11 = texture(shadowtex0, p.xy + vec2(-e, -e)).r;
-		s += (d00 + bias > p.z) ? 1.0 : 0.0;
-		s += (d10 + bias > p.z) ? 1.0 : 0.0;
-		s += (d01 + bias > p.z) ? 1.0 : 0.0;
-		s += (d11 + bias > p.z) ? 1.0 : 0.0;
+		s += (d00 > 0.995 || d00 + bias > p.z) ? 1.0 : 0.0;
+		s += (d10 > 0.995 || d10 + bias > p.z) ? 1.0 : 0.0;
+		s += (d01 > 0.995 || d01 + bias > p.z) ? 1.0 : 0.0;
+		s += (d11 > 0.995 || d11 + bias > p.z) ? 1.0 : 0.0;
 		s *= 0.25;
 	}
 	return 1.0 - (1.0 - s) * fade;
@@ -186,7 +197,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 天光分量（仅供 ambient 门控 skyVis 使用，不参与漫反射 light）：
 	// 白天阴影衰减 + 夜晚衰减——ambient 只在"天光接近零"时关闭，
 	// 夜晚无光处保持弱门控（0.12），环境光不覆盖材质
-	float sky = skyRaw * (1.0 - 0.4 * shadowAmt * df);
+	float sky = skyRaw * (1.0 - 0.5 * shadowAmt * df);
 	sky *= mix(1.0, 0.15, 1.0 - df);
 	// ===== 照明合成（亮度锚点 = 原版 r 通道，颜色中性） =====
 	// 三分屏 debug 定论：① 原版 lightmap 的 r 通道（max 天光/方块光
@@ -199,7 +210,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 白天阴影修正（只作用天光主导区）：阴影处天光 ×0.6~1，
 	// 火把/萤石旁（r−g 大）系数 = 1 保留原版亮度
 	float skyCorr = mix(1.0,
-		1.0 - 0.4 * shadowAmt * df,
+		1.0 - 0.5 * shadowAmt * df,
 		1.0 - blockMask);
 	// 夜晚低光衰减（按天光 g 平滑 0.25~0.5）：方块光已完全走加法
 	// （不衰减——多光源缝隙亮、萤石四周无阴影圈），只有天光需要
@@ -238,9 +249,14 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 下的草地/泥土带暖调。受光面 ≈ (0.94+0.35×ndl)×albedo，HDR
 	// 压缩边缘，朝阳面略过曝有阳光感但不至于整片发白（旧 0.55 的
 	// 教训是沙子被压平，0.35 控制在高光区内）
+	// 雨天太阳光衰减（参考 Derivative VolumetricFog:
+	// directIlluminance × oneMinus(0.95×wetness)）：阴天云层吸收
+	// 阳光——直射几乎归零、阴影变淡，环境天光主导。雨天的冷灰
+	// 色调来自"没有太阳光"而非整体混色（色调由此处实现）
+	float rainAtten = 1.0 - 0.9 * wetness;
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
-	color += albedo * vec3(1.0, 0.9, 0.75) * 0.35 * ndl * sh * df * (0.35 + 0.65 * skyLm);
+	color += albedo * vec3(1.0, 0.9, 0.75) * 0.35 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
 	// 月光
 	vec3 md = moonDirV();
 	float ndm = clamp(dot(n, md), 0.0, 1.0);
@@ -248,7 +264,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 月光 0.02×0.335 ≈ 0.007×albedo——极淡的冷色轮廓点缀；
 	// 洞穴/室内 skyLm=0 → 归零。0.15→0.07→0.04→0.02 连续下调
 	float moonK = clamp(skyLm * 5.0, 0.0, 0.5);
-	color += albedo * vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK;
+	color += albedo * vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK * rainAtten;
 	// 环境天光(ambient sky light)：微弱、偏蓝紫、不依赖法线方向的漫反射——
 	// 夜晚背光面（树干阴面、地形背光坡）收到极少量天空光。
 	// 门控用衰减后的天光 sky：夜晚户外 0.04×12≈0.48 半开、洞穴≈0 关闭、
@@ -267,7 +283,11 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	vec3 h = normalize(sd + viewDir);
 	float ndh = clamp(dot(n, h), 0.0, 1.0);
 	vec3 specC = mix(vec3(1.0), albedo, metal * 0.9);
-	color += specC * sunC * pow(ndh, shiny) * sh * df * smoothness * 1.1;
+	color += specC * sunC * pow(ndh, shiny) * sh * df * smoothness * 1.1 * rainAtten;
+	// 金属漫反射衰减（PBR：金属无漫反射——漫反射项随金属度衰减，
+	// 金属面亮度主要来自环境/镜面反射——配合 gbuffers 的天空穹顶
+	// 反射，LabPBR 金属方块呈现金属观感而非"带色高光"）
+	color *= 1.0 - metal * 0.8;
 	// 自发光（emission）：
 	// finalColor = surfaceColor(baseColor×lighting) + emission
 	// emission = emissiveMask × baseColor × emissionStrength——

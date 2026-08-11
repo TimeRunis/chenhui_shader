@@ -41,6 +41,7 @@ in vec3 normalV;
 uniform float alphaTestRef;
 
 #include "/lib/noise.glsl"
+#include "/lib/sky.glsl"
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 2) out vec4 fragOut2;
@@ -85,6 +86,15 @@ void main() {
 
 	vec3 viewDir = normalize(viewPos);
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, smoothness, metal, emissive, SHADOW_QUALITY);
+	// PBR 环境反射（金属/光滑表面反射天空穹顶——近似环境反射）：
+	// 反射方向 = 视线关于法线的镜像（世界空间），采样程序化天空
+	// （传 cloudLevel=0：云不参与反射且零开销）。强度 = smoothness
+	// × 金属系数——LabPBR 光滑/金属方块有明显环境反射，哑光微弱
+	if (smoothness > 0.1) {
+		vec3 rvN = normalize(mat3(gbufferModelViewInverse) * reflect(viewDir, n));
+		vec3 skyRefl = getSkyColor(rvN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+		color += skyRefl * smoothness * mix(0.12, 0.45, metal);
+	}
 
 	// ---- 动态光源标记：高方块光判定 ----
 	float lightFlag = (texture(lightmap, lmcoord).b >= 0.84) ? 1.0 : 0.0;

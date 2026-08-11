@@ -24,7 +24,7 @@ in vec2 texcoord;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
-#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图)
+#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图 12=阴影遮挡判定 13=阴影深度原始值 14=正确UV阴影图 15=阴影投影原始值)
 
 // colortex0（gbuffers 主颜色 + alpha 方块光等级）用半浮点：
 // RGBA8 下 PRE_EXPOSURE 0.62 把漫反射量化精度砍掉 40%，圆石细颗粒
@@ -167,13 +167,15 @@ void main() {
 			// 半径 0.8%（原 1.6%→1.1%）：光源影响范围收窄——方块光
 			// 本身已有距离衰减（calcLight 幂压缩），屏幕扩散只需
 			// 削平 16 级阶梯的边缘，不需要额外扩大光斑半径
-			float R = max(5.0, viewHeight * 0.008);
+			// 半径 1.2%（原 0.8%）：覆盖"萤石旁柱子"类场景——旧 0.8%
+			// 核（±17px）够不到光源外几格的遮挡物，中点检测形同虚设
+			float R = max(5.0, viewHeight * 0.012);
 			float st = R * 0.5;
 			vec2 px = vec2(1.0 / viewWidth, 1.0 / viewHeight);
 			float diffB = 0.0;
 			float wsum = 0.0;
-			for (int i = -2; i <= 2; i++) {
-				for (int j = -2; j <= 2; j++) {
+			for (int i = -3; i <= 3; i++) {
+				for (int j = -3; j <= 3; j++) {
 					vec2 off = texcoord + vec2(float(i), float(j)) * st * px;
 					if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
 					float d2 = texture(depthtex0, off).r;
@@ -633,6 +635,48 @@ void main() {
 		// 该渲染走了带纹理采样的程序（非 gbuffers_water 程序色
 		// 0.30/0.50/0.62，灰度 ≈0.44）
 		color = vec3(texture(colortex2, texcoord).r);
+	} else if (DEBUG_SSR == 12) {
+		// 诊断：太阳阴影遮挡判定——重建当前像素世界位置并做一次
+		// shadowSample（法线近似朝上）：白 = 判定受光、黑 = 阴影。
+		// 全白 = 深度比较恒真（Iris 阴影深度方向/约定不符）；
+		// 全黑 = 恒假；有明暗 = shadowSample 正常（问题在强度/视觉）
+		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
+		float shD = shadowSample(wpD, vec3(0.0, 1.0, 0.0), 1);
+		color = vec3(shD);
+	} else if (DEBUG_SSR == 13) {
+		// 诊断：阴影比较原始数值——R = shadowtex0 采样深度 d、
+		// G = 当前点太阳深度 p.z、B = p.z 越界标记（1 = 越界）。
+		// 对照 d 与 p.z 的明暗关系判断深度方向；B 红 = p.z 映射错
+		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
+		vec4 spD = shadowProjection * shadowModelView * vec4(wpD, 1.0);
+		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
+		float dD = texture(shadowtex0, pD.xy).r;
+		float oob = (pD.x < 0.0 || pD.x > 1.0 || pD.y < 0.0 || pD.y > 1.0 || pD.z < 0.0 || pD.z > 1.0) ? 1.0 : 0.0;
+		color = vec3(dD, pD.z, oob);
+	} else if (DEBUG_SSR == 14) {
+		// 诊断：正确太阳相机 UV 的 shadow 图内容——屏幕每个像素重建
+		// 世界位置 → 投影到太阳相机 UV → 采样 shadowtex0 灰度显示。
+		// 方块/树区域若显示为暗（有深度内容）= 方块进了 shadow 图；
+		// 若方块区域与地形一样亮（clear 1.0 反向近）= 方块未渲染进图
+		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
+		vec4 spD = shadowProjection * shadowModelView * vec4(wpD - cameraPosition, 1.0);
+		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
+		if (pD.x >= 0.0 && pD.x <= 1.0 && pD.y >= 0.0 && pD.y <= 1.0) {
+			color = vec3(texture(shadowtex0, pD.xy).r);
+		} else {
+			color = vec3(0.5, 0.5, 0.5); // 图外 = 中灰（与图内区分）
+		}
+	} else if (DEBUG_SSR == 15) {
+		// 诊断：阴影投影原始值（一次回答三个问题）——
+		// R = p.z 原始值（sp.z/sp.w×0.5+0.5，未做越界 return）
+		//    明暗分布判断深度域：近处亮 = 标准（近=0）；近处暗 = 反向
+		// G = 越界标记（1 = p 越界 → shadowSample 会 return 1.0 受光）
+		// B = sp.w 符号（1 = sp.w>0 正常；0 = sp.w≤0 → return 1.0 受光）
+		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
+		vec4 spD = shadowProjection * shadowModelView * vec4(wpD - cameraPosition, 1.0);
+		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
+		float oob = (pD.x < 0.0 || pD.x > 1.0 || pD.y < 0.0 || pD.y > 1.0 || pD.z < 0.0 || pD.z > 1.0) ? 1.0 : 0.0;
+		color = vec3(pD.z, oob, (spD.w > 0.0) ? 1.0 : 0.0);
 	}
 	fragOut0 = vec4(color, 1.0);
 }

@@ -91,7 +91,7 @@ vec3 cloudShade(float avgLit, float df, float wet) {
 float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
 	// 云带分布（localCoverage）：fbm2 2 oct 替代 noisetex
 	float localCoverage = fbm2(p.xz * 2e-4 - wind.xz * 2e-3, 2);
-	localCoverage = clamp(localCoverage * 3.0 + wetness - 0.4, 0.0, 1.0) * 0.5 + 0.5;
+	localCoverage = clamp(localCoverage * 3.0 + rainStrength - 0.4, 0.0, 1.0) * 0.5 + 0.5;
 	if (localCoverage < 0.1) return 0.0;
 	// 3D 密度场（5 oct ×3 递进；z 直接偏移不放大——Derivative 的
 	// 3D 噪声垂直频率与水平一致（特征 2500/3ⁱ 格）。旧 fbm3 风格
@@ -119,7 +119,7 @@ float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
 	// 边缘仍自然稀疏淡出
 	float normalizedHeight = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
 	float heightAttenuation = clamp(normalizedHeight * 6.6, 0.0, 1.0)
-	                         * clamp((1.0 - normalizedHeight) * (2.0 + wetness), 0.0, 1.0);
+	                         * clamp((1.0 - normalizedHeight) * (2.0 + rainStrength), 0.0, 1.0);
 	density *= heightAttenuation * 1.9;
 	density -= heightAttenuation * 0.6 + normalizedHeight * 0.3 + 0.05;
 	// 最终倍率 = Derivative 默认 ×3.0（× cloudDensity 选项，
@@ -208,7 +208,7 @@ vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDens
 	// 平均散射光照 = lit/dens（每密度单位的散射光，0~1）：
 	// 朝向太阳的云 avgLit 高 → 亮，背光/密云 → 暗
 	float avgLit = (dens > 0.001) ? lit / dens : 0.0;
-	vec3 ccol = cloudShade(clamp(avgLit, 0.0, 1.0), df, wetness);
+	vec3 ccol = cloudShade(clamp(avgLit, 0.0, 1.0), df, rainStrength);
 	// 垂直分层：云底暗冷、云顶亮（ty = 最后采样点归一化高度，
 	// 0=层底 1=层顶）——云有上下明暗层次，不是均匀色块
 	ccol = mix(ccol * 0.6, ccol, smoothstep(0.15, 0.5, ty));
@@ -301,7 +301,7 @@ vec3 overworldSky(vec3 dir, float stars, float sunGlow, float sunSize, float moo
 	// 雾混合由调用方（composite1 的 hz×0.45）继续叠加
 	if (dir.y <= 0.0) {
 		vec3 horizonD = mix(vec3(0.012, 0.02, 0.04), vec3(0.66, 0.75, 0.88), df);
-		horizonD *= (1.0 - wetness * 0.55);
+		horizonD *= (1.0 - rainStrength * 0.55);
 		return volCloud(dir, horizonD, df, cloudLevel, cloudDensity);
 	}
 	// 冷暖色调分离（瑞利散射式）：地平线基础色 = 夜晚深邃冷蓝 → 白天清亮
@@ -318,7 +318,7 @@ vec3 overworldSky(vec3 dir, float stars, float sunGlow, float sunSize, float moo
 	// 低角度太阳散射：暖色强度 = 太阳倾斜因子（warm），色相橙黄→淡粉
 	horizon += warmC * (warm * 0.9);
 	vec3 sky = mix(horizon, zenith, pow(up, 0.5));
-	sky *= 1.0 - wetness * 0.55;            // 雨天天空变暗
+	sky *= 1.0 - rainStrength * 0.55;       // 雨天天空变暗（跟随降雨强度，雨停即恢复）
 	// 太阳：细节盘面（世界空间，泛光在 composite1 屏幕空间绘制）
 	sky += sunDetail(dir, sunSize * 0.0566);
 	// 月亮：固定满月 + 细节 + 泛光（世界空间方向，视角转动时固定）
