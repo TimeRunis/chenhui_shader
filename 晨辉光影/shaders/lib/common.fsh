@@ -40,6 +40,14 @@ uniform sampler2DShadow shadowtex1; // Iris 硬件深度比较纹理（Derivativ
 // 覆盖材质（0.20 → 0.12 → 0.06 → 0.025 逐级下调）
 #define AMBIENT_LIGHT_STRENGTH 0.025
 
+// 临时 DEBUG_LIGHT：光照链路分解（"灰白膜"根因验证用，验证后删）
+// 0=关闭 1=albedo 2=albedo×ambient光(天光+环境) 3=albedo×direct光
+// (方块光+太阳+月光) 4=albedo×(ambient+direct) 5=emissive only
+// 7=lightmap 原值 8=skyNight（关键：观察是否随点光源区域变亮=耦合证据）
+// 9=blockAmt（与 8 对比空间分布） 10=R=lm.g G=nightK B=skyNight（数值范围）
+// 11=R=nightK G=dayFactorF B=lmUV.y（夜晚衰减曲线观察）
+#define DEBUG_LIGHT 0
+
 // 深度线性化（近裁剪面/远裁剪面）
 float linDepth(float d) {
 	return (2.0 * near * far) / (far + near - d * (far - near));
@@ -97,14 +105,27 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	// deferred5: worldPos = mat3(gbufferModelViewInverse)×viewPos，
 	// 不含 cameraPosition）——传相对坐标，否则偏移 cameraPosition
 	// 导致投影全部越界（debug 15 青色 = 全受光的根因）
-	// 法线偏移（Derivative deferred5 normalOffset 适配）：沿世界法线
-	// 推接收面位置防 acne——旧斜率深度 bias 会收缩/错位阴影轮廓
-	// （Peter Panning，阴影脱离物体）；正交投影 texel 世界尺寸恒定
-	// （96 格/2048 ≈ 0.047 格），偏移 1~3 texel 量级 + 掠射角加成
+	// 深度偏移沿太阳方向（光照空间纯深度 bias，防 acne）：
+	// 旧版沿世界法线推接收面（Derivative normalOffset 适配）——背光面
+	// ndl=0 偏移最大（0.15 格）且方向背向太阳，在阴影图中产生屏幕位移
+	// （≈1.6~3 texel）。高太阳角时顶面在阴影图里的投影带只有
+	// cosθ≈0.17 格高，背光面采样点被推出投影带 → 采样到背景（判受光）
+	// → "背光面只有下缘约 1/4 阴影（半圆形）"的根因。沿太阳轴偏移
+	// 是纯深度变化（正交相机下屏幕坐标不变）：采样点永远留在方块
+	// 自身轮廓内，背光面稳定读到顶面遮挡判阴影；受光面深度变浅
+	// 获得 acne 容差——两种目的同时成立，且无屏幕位移
 	vec3 relPos = worldPos - cameraPosition;
-	vec3 nW = normalize(mat3(gbufferModelViewInverse) * n);
 	float ndlC = clamp(dot(n, sunDirV()), 0.0, 1.0);
-	vec3 nOff = nW * (0.05 + 0.05 * (2.0 - ndlC));
+	// 偏移沿 +sunDirW（推向太阳，深度变浅 = 受光侧容差）——
+	// 旧版误用 -sunDirW（背向太阳，深度变深）：受光面自身图深度
+	// 浅于采样点 → 受光面全部误判阴影（"方块正面出现阴影"、
+	// "白天整体变暗"的根因），且背光面"全阴影"只是方向错误的巧合。
+	// 偏移量按受光程度缩放（0.03 + 0.09×ndl）：
+	// 背光面（ndl=0）只给 0.03 格——顶穿亮带 ≈ bias/(sinθ+cosθ)
+	// ≈ 面高 2%（亚像素不可见），且背光面不需要 acne 容差（本就
+	// 深阴影）；正对太阳的面（ndl=1）给 0.12 格防 acne（受光面
+	// 顶穿无害：采样点在自身与太阳之间，深度仍浅于自身图 → 判受光）
+	vec3 nOff = sunDirW() * (0.03 + 0.09 * ndlC);
 	vec4 sp = shadowProjection * shadowModelView * vec4(relPos + nOff, 1.0);
 	if (sp.w <= 0.0) return 1.0;
 	vec3 p = sp.xyz / sp.w * 0.5 + 0.5;
@@ -144,8 +165,12 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	float blockerDepth = (sumWeight > 0.001) ? searchDepth / sumWeight : 1.0;
 	// 半影比例（遮挡物相对距离，0=无/紧贴接收面 1=远遮挡）
 	float penumbraRatio = max(min(2.0 * (p.z - blockerDepth) / max(blockerDepth, 1e-4), 1.0), 0.0);
-	// PCF 半径：比例 × 4 texel 上限，下限 1 texel
-	float penumbra = max(penumbraRatio * 4.0, 1.0) / shadowRes;
+	// PCF 半径：比例 × 4 texel 上限，下限 2 texel——
+	// 阴影图 2048/192 格 ≈ 0.094 格/texel。3 texel 过软（"阴影太
+	// 模糊"反馈），2 texel（≈0.19 格）兼顾轮廓清晰与边缘柔化；
+	// 太阳升起时"半格半格跳动"是 5 texel 量级，与软边无关，
+	// 需另查（疑似 Iris 太阳角度更新或光照图步进）
+	float penumbra = max(penumbraRatio * 4.0, 2.0) / shadowRes;
 	// Poisson PCF
 	int smp = (taps >= 2) ? 16 : 8;
 	float pz = p.z - (1e-4 - dither * 5e-5);  // z 微抖动防 acne
@@ -251,12 +276,12 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 跳变（旧的 r/r−g 掩码衰减在露天光斑边缘制造 1 格内 3~4 倍
 	// 跳变 = "萤石四周阴影圈"的根因）；洞穴 g≈0.03 → 天光≈0 自然黑
 	float nightK = mix(0.3, 1.0, smoothstep(0.25, 0.5, lm.g));
-	// 光斑内天光放松：方块光主导区（blockAmt 大）天光恢复全量
-	// （月光 0.267 参与混合——"光源与天空光混合"，光斑内不再是
-	// 纯暖光；光斑外仍衰减 0.083 保持夜晚暗）。过渡带 = blockAmt
-	// 0~0.3（方块光 5.2~8 级，光斑 8~11 格外）2 格以上连续渐变，
-	// 无"萤石四周阴影圈"
-	float skyNight = mix(nightK, 1.0, smoothstep(0.0, 0.3, blockAmt));
+	// 夜间天光只由 lm.g/时间决定（已解除 blockAmt 耦合）：
+	// 旧版 skyNight = mix(nightK, 1.0, smoothstep(0, 0.3, blockAmt))
+	// 让点光源越强、夜间环境光越接近白天 1.0——DEBUG 8/9/10 实测
+	// skyNight 的空间分布与 blockAmt 光斑完全一致（光斑内 =1.0 白）。
+	// 物理语义：火把只增加局部方块光，不把夜间天光恢复成白天
+	float skyNight = nightK;
 	// 天光：乘法（物理着色——albedo 色相与纹理保留，圆石颗粒清晰）
 	vec3 color = albedo * vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df);
 	// 方块光：乘法式合成——albedo×[0.85 中性白 + 0.15 暖橙]
@@ -275,12 +300,10 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// vec3(1.0,0.5,0.25)×0.15 直接 += 到最终 RGB（不乘 albedo）=
 	// 圆石表面蒙一层半透明橙黄、材质颜色与细节被冲淡
 	color += albedo * blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF;
-	// 太阳直射（用户需求"阳光照射大地"）：强度 0.15 → 0.35——
-	// 大地有明确的受光面（朝阳亮、背阴暗），阴影处无直射（sh），
-	// 阳光方向感与明暗对比清晰。颜色暖化（1.0/0.9/0.75）——阳光
-	// 下的草地/泥土带暖调。受光面 ≈ (0.94+0.35×ndl)×albedo，HDR
-	// 压缩边缘，朝阳面略过曝有阳光感但不至于整片发白（旧 0.55 的
-	// 教训是沙子被压平，0.35 控制在高光区内）
+	// 太阳直射：强度 0.35 → 0.25（用户反馈"沙漠沙子亮度很高"——
+	// 沙子 albedo≈(0.76,0.68,0.46)×(0.94 天光 + 0.25×ndl×...) 全天
+	// 受光面 ≈1.1×albedo 压进 HDR 压缩边缘发白；0.25 保留阳光方向感
+	// 且沙子纹理不再被顶到压缩区）
 	// 雨天太阳光衰减（参考 Derivative VolumetricFog:
 	// directIlluminance × oneMinus(0.95×wetness)）：阴天云层吸收
 	// 阳光——直射几乎归零、阴影变淡，环境天光主导。雨天的冷灰
@@ -288,7 +311,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float rainAtten = 1.0 - 0.9 * wetness;
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
-	color += albedo * vec3(1.0, 0.9, 0.75) * 0.35 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
+	color += albedo * vec3(1.0, 0.9, 0.75) * 0.25 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
 	// 月光
 	vec3 md = moonDirV();
 	float ndm = clamp(dot(n, md), 0.0, 1.0);
@@ -327,5 +350,42 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 也不会把纹理冲淡成纯色；强度 0.45（0.3~0.6 设计范围）。
 	// 原版材质无 specular 贴图（emissive 归零）不受影响
 	color += albedo * emissive * 0.45;
+	// ===== 临时 DEBUG_LIGHT：光照链路分解（验证后删） =====
+	#if DEBUG_LIGHT > 0
+		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df)
+		                 + ambC * skyVis * (1.0 - 0.5 * shadowAmt) * (1.0 - df);
+		vec3 directDbg = blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF
+		               + vec3(1.0, 0.9, 0.75) * 0.25 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
+		               + vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK * rainAtten;
+		#if DEBUG_LIGHT == 1
+			return albedo;
+		#elif DEBUG_LIGHT == 2
+			return albedo * ambLightDbg;
+		#elif DEBUG_LIGHT == 3
+			return albedo * directDbg;
+		#elif DEBUG_LIGHT == 4
+			return albedo * (ambLightDbg + directDbg);
+		#elif DEBUG_LIGHT == 5
+			return albedo * emissive * 0.45;
+		#elif DEBUG_LIGHT == 7
+			// lightmap 原值直显（R=天光/方块光 max、G=天光、B=烘焙）
+			return lm;
+		#elif DEBUG_LIGHT == 8
+			// 只显示 skyNight（灰白膜验证关键）：点光源区域若整片变白
+			// =1.0 → skyNight 被 blockAmt 抬升 = 耦合证据
+			return vec3(skyNight);
+		#elif DEBUG_LIGHT == 9
+			// 只显示 blockAmt：应与火把距离衰减的菱形光斑形状一致，
+			// 与 DEBUG 8 的空间分布对比判断耦合
+			return vec3(blockAmt);
+		#elif DEBUG_LIGHT == 10
+			// 数值范围观察：R=lm.g（午夜天光实测值）G=nightK
+			// B=skyNight（光斑内/外各记一组，供第二阶段 nightK 曲线定标）
+			return vec3(lm.g, nightK, skyNight);
+		#elif DEBUG_LIGHT == 11
+			// 夜晚衰减观察：R=nightK G=dayFactorF B=lmUV.y（天光级数坐标）
+			return vec3(nightK, df, lmUV.y);
+		#endif
+	#endif
 	return color;
 }

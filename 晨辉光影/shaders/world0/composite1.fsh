@@ -631,12 +631,9 @@ void main() {
 	float lumaT = dot(color, vec3(0.2126, 0.7152, 0.0722));
 	float hdrK = mix(1.0, 1.0 / max(lumaT, 1e-4), smoothstep(0.85, 1.25, lumaT));
 	color *= hdrK;
-	// 暗部保护：final 的暗部用弱伽马 1.4（不再线性直出），暗部不被
-	// 显示器压成死黑；保护系数 25%——纯暗处压到 25% 保留轮廓层次
-	// （0.35 时无光处整体抬得太平坦，均匀发亮像夜视），夜晚无光处
-	// 深色 ≈0.03 可辨、浅色 ≈0.08
-	float lumaDark = dot(color, vec3(0.2126, 0.7152, 0.0722));
-	color *= mix(0.25, 1.0, smoothstep(0.0, 0.12, lumaDark));
+	// 暗部保护已移除（灰白膜修复）：旧版按亮度分段（luma<0.12 压暗
+	// 25%）与 final.fsh 的分段伽马共同把光斑衰减带重塑成灰带——
+	// "非最高光照区灰白膜"的根因。渲染管线保持线性直出
 	// 对比度：不再做——偏移式对比度（(x-0.5)×1.25+0.5）会把亮部
 	// （>0.9）推过 1.0 再 clamp：萤石 face（light 0.94 + emission 0.45
 	// ≈ 1.2）纹理差被整体压平（"萤石材质不明显"）；同时把 0.5 以下的
@@ -708,7 +705,7 @@ void main() {
 		// G = 当前点太阳深度 p.z、B = p.z 越界标记（1 = 越界）。
 		// 对照 d 与 p.z 的明暗关系判断深度方向；B 红 = p.z 映射错
 		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
-		vec4 spD = shadowProjection * shadowModelView * vec4(wpD, 1.0);
+		vec4 spD = shadowProjection * shadowModelView * vec4(wpD - cameraPosition, 1.0);
 		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
 		float dD = texture(shadowtex0, pD.xy).r;
 		float oob = (pD.x < 0.0 || pD.x > 1.0 || pD.y < 0.0 || pD.y > 1.0 || pD.z < 0.0 || pD.z > 1.0) ? 1.0 : 0.0;
@@ -805,6 +802,17 @@ void main() {
 		// 灰 0.5-0.99 = 命中真实场景深度（近-中距离）
 		// 白 = 1.0 不可能（命中条件 depth<1.0 已排除）
 		color = vec3(dbgSsrHitDepth);
-	}
-	fragOut0 = vec4(color, 1.0);
+	} else if (DEBUG_SSR == 32) {
+			// 诊断：阴影图内容 vs 接收面深度差（放大 200 倍）——
+			// 灰 ≈0.5 = 阴影图存的正是当前表面自己（背光面若为灰
+			// → 阴影 pass 把背光面写进了图 = 剔除方向错误，根因）；
+			// 亮 >0.7 = 图中有更近遮挡物（正常）；黑 <0.3 = 图比
+			// 接收面还远（越界/投影错）。受光面因 bias 略亮（≈0.6）
+			vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
+			vec4 spD = shadowProjection * shadowModelView * vec4(wpD - cameraPosition, 1.0);
+			vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
+			float dD = texture(shadowtex0, pD.xy).r;
+			color = vec3(clamp((dD - pD.z) * 200.0 + 0.5, 0.0, 1.0));
+		}
+fragOut0 = vec4(color, 1.0);
 }
