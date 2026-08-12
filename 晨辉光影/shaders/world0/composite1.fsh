@@ -394,7 +394,11 @@ void main() {
 								// → 反射纯黑 = "深色区域"根因（debug 31 命中
 								// 深度≈0、debug 19 采样纯黑证实）。深度下限
 								// 0.01：合法场景深度（近处 0.5 格起）远大于此
-								if (depth > 0.01 && depth < 1.0 && hitWp.y > waterWp.y + 0.15) {
+								// 深度下限 = 水面深度：反射内容必然比水面更远。
+								// 旧 0.01 下限只挡清屏值——相机与水之间的物体
+								// （头顶方块等，depth < 水面深度）会沿屏幕射线
+								// 被误命中 = "头顶方块出现在水面上"的根因
+								if (depth > dbgWd && depth < 1.0 && hitWp.y > waterWp.y + 0.15) {
 									dbgSsrCand = 1.0;
 									// 反射内容 = 当前像素 gcolor（远处低频）
 									vec2 suv = rayPos.xy * vec2(1.0 / viewWidth, 1.0 / viewHeight);
@@ -414,7 +418,7 @@ void main() {
 								}
 							}
 							// 命中候选：场景深度 < 射线深度（射线在表面后面）
-							else if (depth < rayPos.z) {
+							else if (depth < rayPos.z && depth > dbgWd) {
 								float lS = linDepth(depth);
 								float lC = linDepth(rayPos.z);
 								// 相对阈值 0.2：线性深度相对差 <20% 才算命中
