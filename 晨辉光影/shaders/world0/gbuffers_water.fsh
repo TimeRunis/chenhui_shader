@@ -78,8 +78,14 @@ void main() {
 	// 光照、alpha 用纹理值、不写 colortex1 水面深度；否则海带被当
 	// 水面写深度 + alpha 0.65 → composite1 把它识别为水面并执行
 	// SSR（"海带发白/海带出现在反射里"的根因，debug 模式 1 里
-	// 海带显示为白色 mask）
-	if (n.y < 0.5) {
+	// 海带显示为白色 mask）。
+	// 注意：水下抬头看水面时，水面法线在视空间同样 n.y≈0（世界
+	// 朝上 ≈ 视空间 -forward）——旧分支会把水面当植物渲染成原版
+	// 纹理（程序色替换在分支之后）= "水底看水面是原版材质"的根因。
+	// 加蓝色水纹理检测：水（蓝主导）走水面分支，海带（绿）仍走
+	// 植物分支
+	if (n.y < 0.5 && !(albedo.b > albedo.r * 1.5 && albedo.b > 0.3
+	                  && albedo.r < 0.45 && albedo.g < 0.7)) {
 		vec3 colorP = calcLight(albedo, n, lmcoord, viewDir, worldPos, 0.5, 0.0, 0.0, SHADOW_QUALITY);
 		fragOut0 = vec4(colorP * PRE_EXPOSURE, alpha);
 		fragOut2 = vec4(albedo, 1.0);
@@ -99,7 +105,7 @@ void main() {
 	// 振幅系数 0.9（0.35→0.6→0.9：所有水面的波纹都要可见，
 	// 不只是 SSR 反射区域——波浪法线倾斜让水面明暗与高光
 	// 波纹遍布整片水面；密度对齐 Derivative Main 4 层高频波）
-	float amp = (WAVE_AMOUNT / 100.0) * 0.9 * (1.0 + wetness * 1.2);
+	float amp = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
 	vec3 wn = waterNormalWorld(worldPos, amp);
 	// 雨打水面（参考 Derivative Main RainEffect.glsl 的雨法线扰动）：
 	// 湿天水面叠加高频快速变化的雨纹——雨点落下产生细碎波纹，

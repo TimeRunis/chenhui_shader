@@ -45,11 +45,11 @@ uniform float alphaTestRef;
 
 layout(location = 0) out vec4 fragOut0;
 layout(location = 2) out vec4 fragOut2;
-layout(location = 3) out float depthOut; // colortex3 不透明深度（SSR scene depth）
+layout(location = 3) out vec4 fragOut3; // colortex3：r=不透明深度（SSR scene depth），gba=预曝光颜色（水底 caustics 只加亮透出的水底部分用）
 layout(location = 1) out vec4 fragOut1; // colortex1.b 水面材质标志（非水面 = 0）
 void main() {
 	// 不透明深度快照：几何深度写入 colortex3（SSR 用；水面/雨/云/粒子/手持等半透明程序不写，水面像素处保留水底/地形深度）
-	depthOut = gl_FragCoord.z;
+	fragOut3 = vec4(gl_FragCoord.z, 0.0, 0.0, 0.0); // 末尾用真实颜色覆写
 	fragOut1 = vec4(0.0, 0.0, 0.0, 1.0); // 非水面：colortex1.b 显式清零（a=1 保证 blend 下也覆盖）
 	// 几何法线(顶点着色器从 gl_Normal 变换到眼空间);
 	// 无法线属性的程序 gl_Normal=0 → 回退朝上,不破坏兼容
@@ -104,6 +104,7 @@ void main() {
 	// （光源旁 alpha 高，边缘像素向光斑内平均 → 边缘提亮柔和，
 	// 消除 16 级阶梯的硬边；白天太阳直射时 blockSourceLevel 自归零）。
 	// 之前写 1.0 导致扩散全屏空转、光斑边缘保持硬切
+	fragOut3 = vec4(gl_FragCoord.z, color.rgb); // 水底 caustics：预曝光颜色
 	fragOut0 = vec4(color * PRE_EXPOSURE, blockSourceLevel(lmcoord));
 	fragOut2 = vec4(albedo, 1.0);
 }

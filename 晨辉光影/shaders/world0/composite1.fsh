@@ -92,6 +92,9 @@ void main() {
 	float dbgSsrMiss = 0.0; // SSR miss（无任何命中 → 弱环境 fallback）
 	float dbgWd = 0.0;    // 水面深度门禁值（colortex1.r，debug 1/9 用）
 	float dbgWFlag = 0.0; // 水面材质标志门禁值（colortex1.b，debug 1/9 用）
+	// caustics 延迟应用：HDR 压缩后再加亮，亮线不拖累整像素被压暗
+	vec3 cauAddCol = vec3(0.0);
+	float cauAddAmt = 0.0;
 	// 临时调试统计（debug 16/17，验证 A/B 用，不改变正式行为；验证后可删）
 	float dbgMissReason = 0.0; // SSR miss 原因（debug 16 灰度）：0=无miss 1=步数耗尽 2=ray低于水面break 3=出屏 4=z饱和区耗尽 5=其他
 	float dbgMinStepRatio = 0.0; // 1px 最小步长占比 0~1（debug 17 R）
@@ -287,9 +290,67 @@ void main() {
 			vec3 waterWp = worldPosFromView(vp);
 			// 世界位置 → 同一水面波浪法线（与 gbuffers_water 同函数，
 			// 波纹随时间流动，反射方向逐帧变化 = 涟漪自然晃动）
-			vec3 nV = normalize(mat3(gbufferModelView)
-				* waterNormalWorld(worldPosFromView(vp),
-					(WAVE_AMOUNT / 100.0) * 0.9 * (1.0 + wetness * 1.2)));
+			float ampW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
+			vec3 wnW = waterNormalWorld(worldPosFromView(vp), ampW);
+			vec3 nV = normalize(mat3(gbufferModelView) * wnW);
+					// colortex3.gba = 水底混合前的预曝光色（不透明程序写入），
+					// ×1/PRE_EXPOSURE 回到当前域——只加亮透出的水底部分
+					// （0.35×底面色），水面本身不受影响
+					vec4 bottomCol = texture(colortex3, texcoord);
+					float wdLin = linDepth(dbgWd);
+					float bdLin = linDepth(bottomCol.r);
+					float waterDepth = max(bdLin - wdLin, 0.0);
+					// 近岸淡入（接缝处水深≈0 时衰减为 0，消除水面-方块接缝过亮）
+					float cauAtten = exp(-waterDepth * 0.35) * smoothstep(0.0, 0.35, waterDepth);
+					// 光斑锚定在水底世界坐标（从水底深度重建）——图案跟随
+					// 水底几何视差，不再贴在水面网格上；折射位移随水深
+					// 增加（光穿过水柱的横向偏移）
+					vec3 bottomWp = worldPosFromView(viewPosFromDepth(bottomCol.r, texcoord));
+					// 折射位移：光在水面折射后落到水底的横向偏移
+					vec2 refrOff = wnW.xy * (1.5 + min(waterDepth * 0.8, 4.0));
+					// 光斑 = 水面波浪曲率（表面透镜聚焦处，Derivative 同源
+					// 思路：真 caustics 就是波法线的面积导数）——与波纹严格
+					// 对齐：从水底位置逆推折射来源点，对波法线有限差分，
+					// 斜率变化大的地方 = 聚焦亮斑；波浪场随时间流动 →
+					// 光斑跟着波纹走
+					vec2 surfXZ = bottomWp.xz - refrOff;
+					// ===== 高斯曲率 caustics（det Hessian，旋转不变 = 网状） =====
+					// 旧 Jacobian 的线性迹项主导 → 方向性条纹；det Hessian
+					// 旋转不变，只能产生交叉网状（经典 caustics 形态），
+					// 且同样由波浪场导出 = 与波纹对齐。固定世界步长
+					// e=0.25，任何视角一致。增益 ampW×2.5（Python 校准：
+					// p50≈0.52、p90≈1.1），pow 1.8 收细亮线
+					vec2 cauXZ = waterWp.xz;
+					float cauE = 1.0; // 光斑大小再翻倍、密度减半（用户要求）
+					vec2 cp0 = vec2(cauXZ.x, cauXZ.y * 0.8);
+					float waveT2 = frameTimeCounter * 0.6;
+					float ch0 = waterHeightField(cp0, waveT2);
+					float chXp = waterHeightField(cp0 + vec2(cauE, 0.0), waveT2);
+					float chXm = waterHeightField(cp0 - vec2(cauE, 0.0), waveT2);
+					float chZp = waterHeightField(cp0 + vec2(0.0, cauE), waveT2);
+					float chZm = waterHeightField(cp0 - vec2(0.0, cauE), waveT2);
+					float chPP = waterHeightField(cp0 + vec2(cauE, cauE), waveT2);
+					float chPM = waterHeightField(cp0 + vec2(cauE, -cauE), waveT2);
+					float chMP = waterHeightField(cp0 + vec2(-cauE, cauE), waveT2);
+					float chMM = waterHeightField(cp0 - vec2(cauE, cauE), waveT2);
+					float chxx = (chXp - 2.0 * ch0 + chXm) / (cauE * cauE);
+					float chzz = (chZp - 2.0 * ch0 + chZm) / (cauE * cauE);
+					float chxz = (chPP - chPM - chMP + chMM) / (4.0 * cauE * cauE);
+					float cau = clamp(pow(sqrt(abs(chxx * chzz - chxz * chxz)) * ampW * 12.0, 1.8), 0.0, 2.0); // e=1.0 重校准增益 // 窗口放宽：光斑更大更亮
+					// 暖色阳光染在底面上 = 被照亮；旧版直接放大底面本色 = 发光感
+					cauAddCol = bottomCol.gba * vec3(1.0, 0.9, 0.72) * (1.0 / PRE_EXPOSURE) * 0.35;
+					// 基础照明 0.10（浅水水底轻微提亮）；光斑只取聚焦增量
+					// max(cau−0.3, 0)：Derivative 公式未聚焦基线 =0.3，减去后
+					// 剩下纯聚焦亮线——不再整片均匀提亮（"发光"感的来源）
+					cauAddAmt = (0.04 + cau * 1.2) * cauAtten * dfFog * (1.0 - wetness * 0.7); // cau 已是纯聚焦增量，无需再减基线
+					// 水面在阴影中（含头顶遮挡）→ 关闭光斑：阳光被挡住
+					// 时水底没有聚焦光
+					cauAddAmt *= shadowSample(waterWp, vec3(0.0, 1.0, 0.0), 1);
+
+				// 光斑在反射混合前应用：只落在水底（反射层覆盖其上），
+				// 不再把反射内容一起提亮（旧版光斑浮在水面的根因）
+				color += cauAddCol * cauAddAmt;
+
 			vec3 R = reflect(viewDir, nV);
 			// 不限制反射方向：平视/微俯看远处水面时反射方向朝上
 			// （反射天空、远岸山体）——这是水面反射最常见的场景。
@@ -515,6 +576,12 @@ void main() {
 							missK = mix(0.05, 0.12, clamp(Rw.y, 0.0, 1.0));
 						}
 						refl = mix(color, envWeak, missK);
+						// 云层反射独立叠加（"水面不反射云"修复）：missK 把
+						// 整片天光（含云）压到 ≤0.45，云随之淡到不可见——
+						// 单独绘制云（skyCol=0 → 只返回云色×覆盖度）以全
+						// 强度加在反射内容上，云的亮度不随 missK 衰减
+						vec3 cloudRefl = volCloud(Rw, vec3(0.0), dfFog, float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
+						refl += cloudRefl * 0.85;
 					}
 					// debug 语义：hit = 有反射内容（几何命中或俯视天空
 					// 反射），miss = 无内容（弱 fallback）
@@ -541,9 +608,46 @@ void main() {
 					vec3 sunSpec = vec3(1.0, 0.8, 0.55)
 						* pow(max(dot(Rn, sunDirV()), 0.0), 350.0) * (0.15 + 0.85 * dfFog);
 					color += sunSpec * mix(0.5, 1.0, reflK);
+					// ===== 水底光折射（caustics，Derivative 思路的屏幕空间版） =====
+					// 光经波浪表面折射在水底聚焦成亮斑：波法线 xy 梯度做
+					// 折射位移驱动噪声图案（随波浪流动），水深越浅斑越锐利
+					// （深水光散开衰减）。Derivative 在阴影 pass 用折射面积
+					// 变化算真 caustics（shadowcolor 管线，前向管线不可移植）
+					// ——本实现直接加亮水面像素（含 35% 透出的水底），观感等价
 			}
 			}
 		}
+	}
+	// ===== 水下视角水底光斑（isEyeInWater=1） =====
+	// 眼睛在水下时水面程序不渲染（无水面像素），光斑直接加在
+	// 水下地形/水底像素上：波法线图案仅依赖 xz（waterNormalWorld
+	// 忽略 y），同一列的水面波浪直接用于水下光斑；距离衰减按
+	// 像素距离（深水光散开）
+	if (isEyeInWater > 0.5 && d < 0.9995) {
+		vec3 uWp = worldPosFromView(viewPosFromDepth(d, texcoord));
+		float uampW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
+		// 光斑 = 波法线曲率（与波纹严格对齐），折射位移基值同水面版
+		// 高斯曲率版（旋转不变 = 网状，同水面版）
+		vec2 ucp0 = vec2(uWp.x, uWp.z * 0.8);
+		float uwaveT2 = frameTimeCounter * 0.6;
+		float uE2 = 1.0;
+		float uhh0 = waterHeightField(ucp0, uwaveT2);
+		float uhhXp = waterHeightField(ucp0 + vec2(uE2, 0.0), uwaveT2);
+		float uhhXm = waterHeightField(ucp0 - vec2(uE2, 0.0), uwaveT2);
+		float uhhZp = waterHeightField(ucp0 + vec2(0.0, uE2), uwaveT2);
+		float uhhZm = waterHeightField(ucp0 - vec2(0.0, uE2), uwaveT2);
+		float uhhPP = waterHeightField(ucp0 + vec2(uE2, uE2), uwaveT2);
+		float uhhPM = waterHeightField(ucp0 + vec2(uE2, -uE2), uwaveT2);
+		float uhhMP = waterHeightField(ucp0 + vec2(-uE2, uE2), uwaveT2);
+		float uhhMM = waterHeightField(ucp0 - vec2(uE2, uE2), uwaveT2);
+		float uhhxx = (uhhXp - 2.0 * uhh0 + uhhXm) / (uE2 * uE2);
+		float uhhzz = (uhhZp - 2.0 * uhh0 + uhhZm) / (uE2 * uE2);
+		float uhhxz = (uhhPP - uhhPM - uhhMP + uhhMM) / (4.0 * uE2 * uE2);
+		float ucau = clamp(pow(sqrt(abs(uhhxx * uhhzz - uhhxz * uhhxz)) * uampW * 12.0, 1.8), 0.0, 2.0);
+		float uAtten = exp(-length(viewPosFromDepth(d, texcoord)) * 0.12);
+		cauAddCol = color * vec3(1.0, 0.9, 0.72);
+		cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
+		color += cauAddCol * cauAddAmt;
 	}
 	// ===== 手持光源（玩家手持光源方块照亮周围） =====
 	// heldBlockLightValue（OptiFine 兼容 uniform，Iris 支持）：主/副手

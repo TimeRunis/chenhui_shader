@@ -59,6 +59,18 @@ void main() {
 
 	vec3 albedo = albedo4.rgb;
 
+	// 水下视角的水面重复渲染检测：Iris 在水下会把水面再次送进
+	// 本程序（原版水纹理、无混合直接覆盖）——把 gbuffers_water
+	// 已画好的程序化水面盖成原版材质（"水底看水面是原版材质"
+	// 的根因）。检测水纹理（蓝主导 + 蓝>红×1.5 + 中等亮度）并
+	// 丢弃本像素，保留 gbuffers_water 的程序水面。
+	// 冰（r 高、近白）与浅色玻璃不匹配，不受影响
+	if (isEyeInWater > 0.5
+		&& albedo.b > albedo.r * 1.5 && albedo.b > 0.3
+		&& albedo.r < 0.45 && albedo.g < 0.7) {
+		discard;
+	}
+
 	// ---- PBR 材质（LabPBR：R=光滑度 G=金属度 B=孔隙度 A=自发光） ----
 	vec4 sp = texture(specular, texcoord);
 	float smoothness = sp.r;
