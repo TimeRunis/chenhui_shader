@@ -24,7 +24,7 @@ in vec2 texcoord;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
-#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图 12=阴影遮挡判定 13=阴影深度原始值 14=正确UV阴影图 15=阴影投影原始值)
+#define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 28 31] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图 12=阴影遮挡判定 13=阴影深度原始值 14=正确UV阴影图 15=阴影投影原始值 16=miss原因分解 17=1px步长占比/射线饱和 18=hit点相对水面高度分类 19=hitUV处gcolor采样 20=SSR合成前基础色 21=refl反射内容 22=reflK权重 23=SSR合成最终 24=hitUV处水面标志 25=hitUV屏幕偏移 26=hit点世界距离 28=几何命中掩码 31=hit时colortex3深度直显)
 
 // colortex0（gbuffers 主颜色 + alpha 方块光等级）用半浮点：
 // RGBA8 下 PRE_EXPOSURE 0.62 把漫反射量化精度砍掉 40%，圆石细颗粒
@@ -92,6 +92,19 @@ void main() {
 	float dbgSsrMiss = 0.0; // SSR miss（无任何命中 → 弱环境 fallback）
 	float dbgWd = 0.0;    // 水面深度门禁值（colortex1.r，debug 1/9 用）
 	float dbgWFlag = 0.0; // 水面材质标志门禁值（colortex1.b，debug 1/9 用）
+	// 临时调试统计（debug 16/17，验证 A/B 用，不改变正式行为；验证后可删）
+	float dbgMissReason = 0.0; // SSR miss 原因（debug 16 灰度）：0=无miss 1=步数耗尽 2=ray低于水面break 3=出屏 4=z饱和区耗尽 5=其他
+	float dbgMinStepRatio = 0.0; // 1px 最小步长占比 0~1（debug 17 R）
+	float dbgMaxRayZ = 0.0;      // 射线最大 z（debug 17 G，>=1.0 = 深度饱和）
+	float dbgHitF = 0.0;         // SSR 最终命中遍数（float 跨作用域，debug 16 门控）
+	float dbgSsrHitDist = 0.0;   // hit 点世界距离（debug 26：近裁剪面≈0 = 无效深度命中）
+	float dbgSsrHitDepth = 0.0;  // hit 时采样的 colortex3 深度原值（debug 31：黑=0 无效深度）
+	// 临时调试变量（debug 18-23，验证 hit 内容用；不改变正式行为）
+	vec3 dbgSsrSample = vec3(0.0); // hitUV 处 gcolor 采样（雾混合前线性域，debug 19）
+	float dbgSsrHitDiff = 0.0;     // hitWp.y - waterWp.y（debug 18：+红=高于水面 -蓝=水下）
+	vec2 dbgSsrHitUV = vec2(0.0);  // hit UV（debug 19 辅助定位）
+	vec3 dbgSsrBase = vec3(0.0);   // SSR 合成前基础水面颜色（debug 20）
+	vec3 dbgSsrFinal = vec3(0.0);  // SSR 合成最终 mix(color, refl, reflK)（debug 23）
 	// 天空判定（双保险）：深度≈1 且（距离达到投影远平面 98% 或超过雾端）。
 	// 只靠 d>0.9995 会把渲染距离边缘的远处方块（深度同样≈1）误判成天空、
 	// 刷成天幕色 → "方块被裁剪"；两个距离条件任一成立即天空，对 fogEnd 异常也健壮
@@ -319,12 +332,18 @@ void main() {
 					float minLength = 1.0; // 1 像素
 					vec3 acc = vec3(0.0);
 					int hitCount = 0; // SSR 命中遍数（miss 判定与命中平均用）
+					// 临时调试统计（debug 16/17）：跨遍累计的 1px 步长计数与射线最大 z
+					int totalMinStep = 0;
+					int totalSteps = 0;
+					float maxZAll = 0.0;
 					for (int k = 0; k < ((WATER_REFLECT > 1) ? 2 : 1); k++) {
 						vec3 col = vec3(0.0); // 本遍命中色（miss 保持 0，不再初始化成天空）
 						// 起点 = 水面像素（像素坐标 + 非线性深度）；高档第 2
 						// 遍相位抖动（±3 像素）→ 波纹亚步长模糊
 						vec3 rayPos = vec3(gl_FragCoord.xy, dbgWd);
 						if (k == 1) rayPos += screenDir * 3.0;
+						float maxZ = rayPos.z; // 本遍射线最大 z（debug 16 区分饱和耗尽）
+						dbgMissReason = 0.0;   // 每遍清零，最终以最后一遍的原因展示
 						// 第一跳：跨到屏幕边界的步长/步数（防止第一步跳出
 						// 屏幕），起点额外推进 dither×步长 + 1 像素
 						// （射线不贴着起点表面开始，避免第一步就与自身
@@ -339,13 +358,18 @@ void main() {
 						float depth = texelFetch(colortex3, ivec2(rayPos.xy), 0).r;
 						for (int i = 0; i < steps; i++) {
 							// 出屏 → miss（ray 飞出屏幕，回退天空）
-							if (rayPos.x < 0.0 || rayPos.x > viewWidth || rayPos.y < 0.0 || rayPos.y > viewHeight) break;
+							if (rayPos.x < 0.0 || rayPos.x > viewWidth || rayPos.y < 0.0 || rayPos.y > viewHeight) { dbgMissReason = 3.0; break; }
 							// ray 仍在屏内（debug 2：screenValid）
 							dbgSsrScreen = 1.0;
 							// 自适应步长（1px ~ 1/步数 屏长钳制）
 							stepLength = abs(depth - rayPos.z) * stepWeight;
-							rayPos += screenDir * clamp(stepLength, minLength, maxLength);
+							float sl = clamp(stepLength, minLength, maxLength);
+							rayPos += screenDir * sl;
 							depth = texelFetch(colortex3, ivec2(rayPos.xy), 0).r;
+							// 临时调试统计（debug 17）：1px 最小步长占比 + 射线 z 最大值
+							if (sl <= minLength * 1.001) totalMinStep++;
+							totalSteps++;
+							maxZ = max(maxZ, rayPos.z);
 							// z 饱和（rayPos.z>=1.0）不 break：非线性深度在
 							// 远处快速饱和（远处水面 wd≈0.9995，旧代码走
 							// 1~2 步就 break = "反射区域≈浅水区面积"的根因
@@ -362,12 +386,26 @@ void main() {
 								// 天空（depth=1.0，far 平面高度必高于水面）单独
 								// 排除 → miss 回退 getSkyColor（与命中天空 gcolor
 								// 等价，但走统一回退路径）
-								if (depth < 1.0 && hitWp.y > waterWp.y + 0.15) {
+								// 修复 S1（无效深度下限）：colortex3 = 0 的像素
+								// （渲染圆外/空中等无 gbuffers 内容区，清屏值）
+								// 会被 z 饱和分支当作"极近场景"命中——hitWp 从
+								// depth=0 重建到近裁剪面（相机高度>水面 → 高度
+								// 判据也通过）→ 采样 gcolor = 0（从未被写入）
+								// → 反射纯黑 = "深色区域"根因（debug 31 命中
+								// 深度≈0、debug 19 采样纯黑证实）。深度下限
+								// 0.01：合法场景深度（近处 0.5 格起）远大于此
+								if (depth > 0.01 && depth < 1.0 && hitWp.y > waterWp.y + 0.15) {
 									dbgSsrCand = 1.0;
 									// 反射内容 = 当前像素 gcolor（远处低频）
 									vec2 suv = rayPos.xy * vec2(1.0 / viewWidth, 1.0 / viewHeight);
 									col = texture(gcolor, suv).rgb * (1.0 / PRE_EXPOSURE);
+									// 临时调试（debug 18/19/26）：保存命中采样、hit 高度与距离
+									dbgSsrSample = col;
+									dbgSsrHitUV = suv;
+									dbgSsrHitDiff = hitWp.y - waterWp.y;
 									float rDist = length(viewPosFromDepth(depth, suv));
+									dbgSsrHitDist = rDist;
+									dbgSsrHitDepth = depth;
 									float fogEdge = smoothstep(fogEnd * 0.9, fogEnd, rDist);
 									float fogF = mix(smoothstep(fogEnd * 0.8, fogEnd, rDist) * fogAmt, 1.0, fogEdge);
 									col = mix(col, fogC, fogF);
@@ -386,7 +424,8 @@ void main() {
 									vec2 suvH = rayPos.xy * vec2(1.0 / viewWidth, 1.0 / viewHeight);
 									vec3 hitWp = worldPosFromView(viewPosFromDepth(depth, suvH));
 									vec3 rayWp = worldPosFromView(viewPosFromDepth(rayPos.z, suvH));
-									if (rayWp.y < waterWp.y) break;
+									// 临时调试记录（debug 16）：ray 重建点低于水面 → break
+									if (rayWp.y < waterWp.y) { dbgMissReason = 2.0; break; }
 									// 高度判据（v2）：命中点必须高于水面——物理
 								// 镜面反射的内容在镜子之上。旧判据
 								// hitWp.y>rayWp.y 在俯视浅水区失效：ray 沿
@@ -419,10 +458,18 @@ void main() {
 											// 射线，高度判据排除）→ gcolor 的透明
 											// 混合污染不影响反射
 											col = texture(gcolor, suv).rgb * (1.0 / PRE_EXPOSURE);
+											// 临时调试（debug 18/19）：保存命中采样与
+											// hit 点相对水面高度（二分收敛后用场景深度重建）
+											dbgSsrSample = col;
+											dbgSsrHitUV = suv;
+											vec3 hitWpF = worldPosFromView(viewPosFromDepth(depth, suv));
+											dbgSsrHitDiff = hitWpF.y - waterWp.y;
 											// 反射点距离雾：与主场景同参
 											// （fogEnd 80% 起，90%~100% 视距
 											// 边缘补满到 1.0）
 											float rDist = length(viewPosFromDepth(rayPos.z, suv));
+											dbgSsrHitDist = rDist;
+											dbgSsrHitDepth = depth;
 											float fogEdge = smoothstep(fogEnd * 0.9, fogEnd, rDist);
 											float fogF = mix(smoothstep(fogEnd * 0.8, fogEnd, rDist) * fogAmt, 1.0, fogEdge);
 											col = mix(col, fogC, fogF);
@@ -435,6 +482,13 @@ void main() {
 						}
 						if (dbgSsrHit > 0.5) { acc += col; hitCount++; } // 只累计命中遍（miss 遍不稀释）
 						dbgSsrHit = 0.0; // 逐遍清零，避免上一遍命中污染下一遍判定
+						// 临时调试记录（debug 16）：本遍未命中且未 break → 步数耗尽；
+						// 若本遍射线 z 达到饱和（>=1.0），标记为 z 饱和区耗尽（4）
+						if (dbgSsrHit < 0.5) {
+							if (dbgMissReason < 0.5) dbgMissReason = (maxZ >= 1.0) ? 4.0 : 1.0;
+						}
+						// 临时调试统计（debug 17）：跨遍累计射线最大 z
+						maxZAll = max(maxZAll, maxZ);
 					}
 					// SSR hit/miss 分离（SSR-2）：
 					vec3 refl;
@@ -462,6 +516,9 @@ void main() {
 					// 反射），miss = 无内容（弱 fallback）
 					dbgSsrHit = (hitCount > 0 || Rw.y > 0.35) ? 1.0 : 0.0;
 					dbgSsrMiss = (hitCount == 0 && Rw.y <= 0.35) ? 1.0 : 0.0;
+					// 临时调试统计（debug 17）：1px 步长占比（全部遍合计）
+					dbgMinStepRatio = float(totalMinStep) / max(float(totalSteps), 1.0);
+					dbgHitF = float(hitCount); // 供 debug 16 在块外判断最终 miss
 					dbgSsrCol = refl;
 					// 菲涅尔反射率：俯视 0.45、掠射 0.9（用户选择增强——
 					// 俯视时附近方块/光源/日月反射明显可见，掠射近全反射）
@@ -470,7 +527,10 @@ void main() {
 					// 俯视 0.45、掠射 0.9。miss 时反射内容已是弱 fallback，
 					// 权重不再决定"天空镜面"强度
 					dbgSsrW = reflK;
+					// 临时调试（debug 20/23）：SSR 合成前基础色与合成最终
+					dbgSsrBase = color;
 					color = mix(color, refl, reflK);
+					dbgSsrFinal = color;
 					// 波光粼粼（太阳镜面高光）独立叠加：所有水面像素都有
 					// ——无命中区域保留弱波光（0.5×），波浪法线让反射方向
 					// 晃动 = 星星点点的波纹闪烁。夜晚弱化只留月光
@@ -677,6 +737,74 @@ void main() {
 		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
 		float oob = (pD.x < 0.0 || pD.x > 1.0 || pD.y < 0.0 || pD.y > 1.0 || pD.z < 0.0 || pD.z > 1.0) ? 1.0 : 0.0;
 		color = vec3(pD.z, oob, (spD.w > 0.0) ? 1.0 : 0.0);
+	} else if (DEBUG_SSR == 16) {
+		// 临时诊断：SSR miss 原因分解（灰度，只在最终 miss 区域非黑）——
+		// 黑 = 命中/非水面  0.2 = 步数耗尽  0.4 = ray重建点低于水面 break
+		// 0.6 = 出屏  0.8 = z 饱和区耗尽  1.0 = 其他
+		// 对比 debug 4（命中）：深色区域若显示 0.4/0.8 → 确认缺陷 B/A
+		color = vec3((dbgHitF < 0.5) ? dbgMissReason / 5.0 : 0.0);
+	} else if (DEBUG_SSR == 17) {
+		// 临时诊断：SSR marching 步长统计——
+		// R = 1px 最小步长占比（0=全大步 ~ 1=所有步都是 1px 爬行）
+		// G = 射线 z 是否达到饱和（1=饱和，配合 R=1 确认 z 饱和区爬行）
+		color = vec3(dbgMinStepRatio, (dbgMaxRayZ >= 1.0) ? 1.0 : 0.0, 0.0);
+	} else if (DEBUG_SSR == 18) {
+		// 临时诊断：hit 点相对水面高度分类（只在 hit 区域非黑）——
+		// R = hit 点高于水面 >0.15 格（正常场景命中：岸/山/建筑）
+		// G = hit 点在水面附近 ±0.15 格（水面自身/波浪起伏带）
+		// B = hit 点低于水面 <-0.15 格（水下命中——高度判据失效，异常）
+		// 全黑 = miss。若深色区域显示蓝 → SSR 命中了水底/水下
+		color = vec3(
+			(dbgSsrHitDiff > 0.15) ? 1.0 : 0.0,
+			(abs(dbgSsrHitDiff) <= 0.15) ? 1.0 : 0.0,
+			(dbgSsrHitDiff < -0.15) ? 1.0 : 0.0);
+	} else if (DEBUG_SSR == 19) {
+		// 临时诊断：hitUV 处的 gcolor 采样（雾混合前，线性域）——
+		// 即反射内容的原始来源。与 debug 21（refl）对比可分离
+		// "采样内容错误" vs "雾/混合错误"
+		color = dbgSsrSample;
+	} else if (DEBUG_SSR == 20) {
+		// 临时诊断：SSR 合成前基础水面颜色（线性域，含逆预曝光/雾）
+		color = dbgSsrBase;
+	} else if (DEBUG_SSR == 21) {
+		// 临时诊断：反射内容 refl（命中色雾化 / miss fallback 后）
+		color = dbgSsrCol;
+	} else if (DEBUG_SSR == 22) {
+		// 临时诊断：Fresnel 权重 reflK（0.45 俯视 ~ 0.9 掠射）
+		color = vec3(dbgSsrW);
+	} else if (DEBUG_SSR == 23) {
+		// 临时诊断：SSR 合成最终 mix(color, refl, reflK)（线性域，
+		// HDR 压缩与暗部保护之前）
+		color = dbgSsrFinal;
+	} else if (DEBUG_SSR == 24) {
+		// 临时诊断：hitUV 处的水面材质标志（colortex1.b）——
+		// 白 = 最终 hit 落在另一个水面像素上（水面自反射！异常）
+		// 黑 = hit 落在非水面像素（正常场景命中）或 miss
+		color = vec3((dbgHitF > 0.5) ? texture(colortex1, dbgSsrHitUV).b : 0.0);
+	} else if (DEBUG_SSR == 25) {
+		// 临时诊断：hitUV 相对当前水面像素的屏幕偏移（像素）——
+		// R = 命中在右侧（0.5=同列，红=偏右，黑=偏左）
+		// G = 命中在上方（0.5=同行，绿=偏上，黑=偏下）
+		// 中灰绿 = hit 落在当前水面附近（自反射/近距离命中）
+		vec2 off = (dbgHitF > 0.5) ? (dbgSsrHitUV - texcoord) * vec2(viewWidth, viewHeight) : vec2(0.0);
+		color = vec3(clamp(off.x * 0.02 + 0.5, 0.0, 1.0), clamp(off.y * 0.02 + 0.5, 0.0, 1.0), 0.0);
+	} else if (DEBUG_SSR == 26) {
+		// 临时诊断：hit 点世界距离（格，灰度 0~100 格）——
+		// 深色区域若 ≈ 0（黑）= 命中近裁剪面 = 无效深度命中（根因验证）
+		// 正常远处场景命中 = 亮
+		color = vec3(clamp(dbgSsrHitDist * 0.05, 0.0, 1.0));
+	} else if (DEBUG_SSR == 28) {
+		// 临时诊断：几何命中掩码（一锤定音）——
+		// 白 = hitCount > 0（真几何命中，反射内容 = 场景采样）
+		// 黑 = 无几何命中（仅 Rw.y>0.35 的天空 fallback "语义命中"）
+		// 深色区域：白 → 采样内容问题；黑 → miss fallback 问题
+		color = vec3(dbgHitF > 0.5 ? 1.0 : 0.0);
+	} else if (DEBUG_SSR == 31) {
+		// 临时诊断：hit 时采样的 colortex3 深度原值（灰度直显）——
+		// 黑 ≈ 0 = 命中"无内容/清屏"像素（无效深度命中，根因）
+		// 灰 0.5-0.99 = 命中真实场景深度（近-中距离）
+		// 白 = 1.0 不可能（命中条件 depth<1.0 已排除）
+		color = vec3(dbgSsrHitDepth);
 	}
 	fragOut0 = vec4(color, 1.0);
 }
