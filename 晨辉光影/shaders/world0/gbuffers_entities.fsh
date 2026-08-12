@@ -32,6 +32,8 @@ in vec3 normalV;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
+#define SUN_STRENGTH 100 // 太阳光强度 [[25 50 75 100 125 150 175 200]]
+#define MOON_STRENGTH 1000 // 月光强度 [0 100 200 300 400 500 600 750 1000 1250 1500 1750 2000]
 
 #include "/lib/common.fsh"
 uniform float alphaTestRef;
@@ -53,7 +55,12 @@ void main() {
 	vec2 lmcoord = lightUV;
 	vec4 vertexColor = tint;
 	vec4 albedo4 = texture(texture, texcoord) * vertexColor;
-	if (albedo4.a < alphaTestRef) discard;
+	// 不完整皮肤（存在透明像素）的黑圈修复：原版 alphaTest=0.1
+	// 会把半透明边缘像素（0.1~1.0）当完全不透明渲染——皮肤淡出
+	// 的毛边变成硬边，衬托在天空/水面等亮背景上就是一圈黑色。
+	// 提高阈值到 0.5：半透明毛边直接丢弃，背景干净透出；正常
+	// 皮肤的 alpha 只有 0/1，不受影响
+	if (albedo4.a < max(alphaTestRef, 0.5)) discard;
 
 	vec3 albedo = albedo4.rgb;
 	vec3 n = normalize(normal);

@@ -117,3 +117,9 @@ value.DEBUG_SSR.7=colortex3 深度快照
 profile.Performance=性能模式
 profile.Balanced=均衡模式
 profile.Extreme=极致模式
+option.SUN_STRENGTH=太阳光强度
+option.SUN_STRENGTH.comment=白天太阳直射光的强度，越高阳光越强烈，越低阳光越柔和
+
+option.MOON_STRENGTH=月光强度
+option.MOON_STRENGTH.comment=夜晚月光的强度，越高夜晚越明亮，越低夜晚越深邃
+

@@ -36,6 +36,8 @@ in vec3 normalV;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
+#define SUN_STRENGTH 100 // 太阳光强度 [[25 50 75 100 125 150 175 200]]
+#define MOON_STRENGTH 1000 // 月光强度 [0 100 200 300 400 500 600 750 1000 1250 1500 1750 2000]
 
 #include "/lib/common.fsh"
 uniform float alphaTestRef;

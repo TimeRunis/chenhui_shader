@@ -24,6 +24,8 @@ in vec2 texcoord;
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
 #define CONTRAST 100 // 对比度 [50 60 70 80 90 100 110 120 130 140 150]
 #define VIGNETTE 40 // 暗角 [[0 20 30 40 50 60 80 100]]
+#define SUN_STRENGTH 100 // 太阳光强度 [[25 50 75 100 125 150 175 200]]
+#define MOON_STRENGTH 1000 // 月光强度 [0 100 200 300 400 500 600 750 1000 1250 1500 1750 2000]
 #define DEBUG_SSR 0 // SSR 调试可视化 [0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 28 31] (1=门禁分解 2=ray在屏内 3=深度穿越候选 4=最终命中 5=反射权重 6=反射色 7=colortex3深度快照 8=SSR miss 9=colortex1直显 10=colortex2 albedo直显 11=shadowtex0阴影图 12=阴影遮挡判定 13=阴影深度原始值 14=正确UV阴影图 15=阴影投影原始值 16=miss原因分解 17=1px步长占比/射线饱和 18=hit点相对水面高度分类 19=hitUV处gcolor采样 20=SSR合成前基础色 21=refl反射内容 22=reflK权重 23=SSR合成最终 24=hitUV处水面标志 25=hitUV屏幕偏移 26=hit点世界距离 28=几何命中掩码 31=hit时colortex3深度直显)
 
 // colortex0（gbuffers 主颜色 + alpha 方块光等级）用半浮点：

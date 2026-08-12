@@ -40,6 +40,16 @@ uniform sampler2DShadow shadowtex1; // Iris 硬件深度比较纹理（Derivativ
 // 覆盖材质（0.20 → 0.12 → 0.06 → 0.025 逐级下调）
 #define AMBIENT_LIGHT_STRENGTH 0.025
 
+// 阳光/月光强度选项（SUN_STRENGTH / MOON_STRENGTH，百分比）：
+// lib 约定"不使用选项宏"的例外——两项位于光照合成核心，由各
+// .fsh 在 include 前定义；无定义时回退 100（默认强度）
+#ifndef SUN_STRENGTH
+#define SUN_STRENGTH 100
+#endif
+#ifndef MOON_STRENGTH
+#define MOON_STRENGTH 1000
+#endif
+
 // 临时 DEBUG_LIGHT：光照链路分解（"灰白膜"根因验证用，验证后删）
 // 0=关闭 1=albedo 2=albedo×ambient光(天光+环境) 3=albedo×direct光
 // (方块光+太阳+月光) 4=albedo×(ambient+direct) 5=emissive only
@@ -311,7 +321,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float rainAtten = 1.0 - 0.9 * wetness;
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
-	color += albedo * vec3(1.0, 0.9, 0.75) * 0.25 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
+	color += albedo * vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
 	// 月光
 	vec3 md = moonDirV();
 	float ndm = clamp(dot(n, md), 0.0, 1.0);
@@ -319,7 +329,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 月光 0.02×0.335 ≈ 0.007×albedo——极淡的冷色轮廓点缀；
 	// 洞穴/室内 skyLm=0 → 归零。0.15→0.07→0.04→0.02 连续下调
 	float moonK = clamp(skyLm * 5.0, 0.0, 0.5);
-	color += albedo * vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK * rainAtten;
+	// 月光强度 0.02 → 0.06（用户要求加强）：深夜户外月光
+	// 0.06×0.335×ndm ≈ 0.02×albedo——可见的冷色月光，夜晚仍保持暗调
+	color += albedo * vec3(0.45, 0.5, 0.75) * (0.06 * (MOON_STRENGTH / 100.0)) * ndm * sh * (1.0 - df) * moonK * rainAtten;
 	// 环境天光(ambient sky light)：微弱、偏蓝紫、不依赖法线方向的漫反射——
 	// 夜晚背光面（树干阴面、地形背光坡）收到极少量天空光。
 	// 门控用衰减后的天光 sky：夜晚户外 0.04×12≈0.48 半开、洞穴≈0 关闭、
@@ -355,8 +367,8 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df)
 		                 + ambC * skyVis * (1.0 - 0.5 * shadowAmt) * (1.0 - df);
 		vec3 directDbg = blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF
-		               + vec3(1.0, 0.9, 0.75) * 0.25 * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
-		               + vec3(0.45, 0.5, 0.75) * 0.02 * ndm * sh * (1.0 - df) * moonK * rainAtten;
+		               + vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
+		               + vec3(0.45, 0.5, 0.75) * (0.06 * (MOON_STRENGTH / 100.0)) * ndm * sh * (1.0 - df) * moonK * rainAtten;
 		#if DEBUG_LIGHT == 1
 			return albedo;
 		#elif DEBUG_LIGHT == 2
