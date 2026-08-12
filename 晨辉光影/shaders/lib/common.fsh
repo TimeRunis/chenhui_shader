@@ -97,48 +97,69 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	// deferred5: worldPos = mat3(gbufferModelViewInverse)×viewPos，
 	// 不含 cameraPosition）——传相对坐标，否则偏移 cameraPosition
 	// 导致投影全部越界（debug 15 青色 = 全受光的根因）
-	vec4 sp = shadowProjection * shadowModelView * vec4(worldPos - cameraPosition, 1.0);
+	// 法线偏移（Derivative deferred5 normalOffset 适配）：沿世界法线
+	// 推接收面位置防 acne——旧斜率深度 bias 会收缩/错位阴影轮廓
+	// （Peter Panning，阴影脱离物体）；正交投影 texel 世界尺寸恒定
+	// （96 格/2048 ≈ 0.047 格），偏移 1~3 texel 量级 + 掠射角加成
+	vec3 relPos = worldPos - cameraPosition;
+	vec3 nW = normalize(mat3(gbufferModelViewInverse) * n);
+	float ndlC = clamp(dot(n, sunDirV()), 0.0, 1.0);
+	vec3 nOff = nW * (0.05 + 0.05 * (2.0 - ndlC));
+	vec4 sp = shadowProjection * shadowModelView * vec4(relPos + nOff, 1.0);
 	if (sp.w <= 0.0) return 1.0;
 	vec3 p = sp.xyz / sp.w * 0.5 + 0.5;
 	// 只检查 xy 越界；p.z 不设 [0,1] 限制——Iris 1.7.2 的
 	// shadowProjection 输出反向 NDC（近处 p.z 可达 1.0），
 	// 旧版 p.z >= 1.0 → return 1.0 会把近处全部排除（全受光）
 	if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
-	// 深度偏移 = 基础 0.001 + 斜率偏移 0.003×(1-法线·光线)
-	float slope = 1.0 - clamp(dot(n, sunDirV()), 0.0, 1.0);
-	float bias = 0.001 + 0.003 * slope;
 	// 阴影图边缘淡出：UV 接近边界时阴影权重平滑降到 0，
 	// 消除 shadowDistance 边缘"阴影突然消失"的方形硬切
 	vec2 uvFade = smoothstep(0.0, 0.04, p.xy) * smoothstep(1.0, 0.96, p.xy);
 	float fade = uvFade.x * uvFade.y;
-	float s = 0.0;
-	if (taps >= 2) {
-		// 3x3 PCF：~0.8 texel@1024——阴影边缘适度柔化但轮廓清晰
-		float e = 0.0008;
-		for (int i = -1; i <= 1; i++) {
-			for (int j = -1; j <= 1; j++) {
-				float d = texture(shadowtex0, p.xy + vec2(float(i), float(j)) * e).r;
-				// 标准深度约定（近=0 远=1，坐标修复后实测 p.z 标准域、
-				// 与 shadow 图同域）：受光 d + bias > p.z（d≈p.z 容差
-				// 内）；阴影 d < p.z（遮挡物更近 = 深度更小）。
-				// clear 空值（d > 0.995 = 内容区外）视为无遮挡受光
-				s += (d > 0.995 || d + bias > p.z) ? 1.0 : 0.0;
-			}
-		}
-		s *= 1.0 / 9.0;
-	} else {
-		// 低档（默认 SHADOW_QUALITY=1）也给 2x2 轻 PCF，避免单采样的方块锯齿
-		float e = 0.0005;
-		float d00 = texture(shadowtex0, p.xy + vec2( e,  e)).r;
-		float d10 = texture(shadowtex0, p.xy + vec2(-e,  e)).r;
-		float d01 = texture(shadowtex0, p.xy + vec2( e, -e)).r;
-		float d11 = texture(shadowtex0, p.xy + vec2(-e, -e)).r;
-		s += (d00 > 0.995 || d00 + bias > p.z) ? 1.0 : 0.0;
-		s += (d10 > 0.995 || d10 + bias > p.z) ? 1.0 : 0.0;
-		s += (d01 > 0.995 || d01 + bias > p.z) ? 1.0 : 0.0;
-		s += (d11 > 0.995 || d11 + bias > p.z) ? 1.0 : 0.0;
-		s *= 0.25;
+	// ===== PCSS 动态半影 + Poisson PCF（Derivative Main 移植） =====
+	// BlockerSearch（deferred5 L257）：8 采样搜索遮挡物平均深度 →
+	// 半影比例 = 遮挡物相对距离（遮挡物远 = 半影宽、近 = 半影窄，
+	// 物理半影形状）→ PCF 半径 1~4 texel（Derivative 原上限 21 texel
+	// 无 TAA 会噪点明显，缩小适配）；无遮挡区 = 1 texel（轮廓清晰）
+	// Poisson 螺旋采样（SunLighting PercentageCloserFilter）：16/8
+	// 采样 + 每像素 dither 旋转（InterleavedGradientNoise 结构化噪声，
+	// pattern 度低于纯随机）→ 半影连续无固定网格台阶（"多影"根因）
+	// z 微抖动（Derivative：shadowProjPos.z -= 1e-4 - dither*5e-5）
+	// 防 acne；手动比较 shadowtex0（Iris 1.7.2 shadowtex1 硬件比较
+	// 实测恒受光不可用）
+	float shadowRes = float(textureSize(shadowtex0, 0).x);
+	float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+	float ang0 = dither * 6.2831853;
+	// PCSS：遮挡物搜索（8 采样螺旋，半径 3 texel）
+	float searchDepth = 0.0;
+	float sumWeight = 0.0;
+	float searchRadius = 3.0 / shadowRes;
+	for (int i = 0; i < 8; i++) {
+		float fi = float(i) + dither;
+		float ang = ang0 + float(i) * 0.7853981;
+		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * searchRadius * sqrt(fi * 0.125);
+		float ds = texture(shadowtex0, sampleCoord).r;
+		if (ds < p.z && ds < 0.995) { searchDepth += ds; sumWeight += 1.0; }
 	}
+	float blockerDepth = (sumWeight > 0.001) ? searchDepth / sumWeight : 1.0;
+	// 半影比例（遮挡物相对距离，0=无/紧贴接收面 1=远遮挡）
+	float penumbraRatio = max(min(2.0 * (p.z - blockerDepth) / max(blockerDepth, 1e-4), 1.0), 0.0);
+	// PCF 半径：比例 × 4 texel 上限，下限 1 texel
+	float penumbra = max(penumbraRatio * 4.0, 1.0) / shadowRes;
+	// Poisson PCF
+	int smp = (taps >= 2) ? 16 : 8;
+	float pz = p.z - (1e-4 - dither * 5e-5);  // z 微抖动防 acne
+	float s = 0.0;
+	for (int i = 0; i < 16; i++) {
+		if (i >= smp) break;
+		float fi = float(i) + dither;
+		float ang = ang0 + float(i) * 0.7853981;
+		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * penumbra * sqrt(fi * (1.0 / 16.0));
+		float d = texture(shadowtex0, sampleCoord).r;
+		// 深度比较：受光 d + 微 bias > pz；clear 空值（d > 0.995）视为受光
+		s += (d > 0.995 || d + 1e-4 > pz) ? 1.0 : 0.0;
+	}
+	s *= 1.0 / float(smp);
 	return 1.0 - (1.0 - s) * fade;
 }
 
