@@ -663,30 +663,48 @@ void main() {
 	// 忽略 y），同一列的水面波浪直接用于水下光斑；距离衰减按
 	// 像素距离（深水光散开）
 	if (isEyeInWater > 0.5 && d < 0.9995) {
-		vec3 uWp = worldPosFromView(viewPosFromDepth(d, texcoord));
-		float uampW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
-		// 光斑 = 波法线曲率（与波纹严格对齐），折射位移基值同水面版
-		// 高斯曲率版（旋转不变 = 网状，同水面版）
-		vec2 ucp0 = vec2(uWp.x, uWp.z * 0.8);
-		float uwaveT2 = frameTimeCounter * 0.6;
-		float uE2 = 1.0;
-		float uhh0 = waterHeightField(ucp0, uwaveT2);
-		float uhhXp = waterHeightField(ucp0 + vec2(uE2, 0.0), uwaveT2);
-		float uhhXm = waterHeightField(ucp0 - vec2(uE2, 0.0), uwaveT2);
-		float uhhZp = waterHeightField(ucp0 + vec2(0.0, uE2), uwaveT2);
-		float uhhZm = waterHeightField(ucp0 - vec2(0.0, uE2), uwaveT2);
-		float uhhPP = waterHeightField(ucp0 + vec2(uE2, uE2), uwaveT2);
-		float uhhPM = waterHeightField(ucp0 + vec2(uE2, -uE2), uwaveT2);
-		float uhhMP = waterHeightField(ucp0 + vec2(-uE2, uE2), uwaveT2);
-		float uhhMM = waterHeightField(ucp0 - vec2(uE2, uE2), uwaveT2);
-		float uhhxx = (uhhXp - 2.0 * uhh0 + uhhXm) / (uE2 * uE2);
-		float uhhzz = (uhhZp - 2.0 * uhh0 + uhhZm) / (uE2 * uE2);
-		float uhhxz = (uhhPP - uhhPM - uhhMP + uhhMM) / (4.0 * uE2 * uE2);
-		float ucau = clamp(pow(sqrt(abs(uhhxx * uhhzz - uhhxz * uhhxz)) * uampW * 12.0, 1.8), 0.0, 2.0);
-		float uAtten = exp(-length(viewPosFromDepth(d, texcoord)) * 0.12);
-		cauAddCol = color * vec3(1.0, 0.9, 0.72);
-		cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
-		color += cauAddCol * cauAddAmt;
+		// 朝向门控（修复：光斑只落在朝上的表面）——屏幕空间法线从
+		// 深度差分重建（邻居像素世界位置叉积）。洞穴天花板（面朝下）
+		// /侧壁不应有光斑：阳光折射只能聚焦在朝天的水底表面。
+		// 叉积零向量（均匀平面像素）→ 无光斑；斜壁（n.y<0.15）无，
+		// 缓坡（n.y 0.15~0.5）渐变。
+		// 步长 2px：1px 时正下方水底（视线近垂直）屏幕位移过小，
+		// 叉积平方跌破旧阈值 1e-8 → 判"无法线"→ 脚下光斑消失
+		vec2 pxN = vec2(2.0 / viewWidth, 2.0 / viewHeight);
+		vec3 pC = worldPosFromView(viewPosFromDepth(d, texcoord));
+		vec3 pNp = worldPosFromView(viewPosFromDepth(texture(depthtex0, texcoord + vec2(pxN.x, 0.0)).r, texcoord + vec2(pxN.x, 0.0)));
+		vec3 pEp = worldPosFromView(viewPosFromDepth(texture(depthtex0, texcoord + vec2(0.0, pxN.y)).r, texcoord + vec2(0.0, pxN.y)));
+		vec3 faceN = cross(pNp - pC, pEp - pC);
+		// 阈值 1e-14：只防精确零向量（normalize 除零 NaN），不再误杀
+		// 正下方小位移叉积
+		float upF = (dot(faceN, faceN) > 1e-14) ? smoothstep(0.15, 0.5, normalize(faceN).y) : 0.0;
+		if (upF > 0.001) {
+			vec3 uWp = pC;
+			float uampW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
+			// 光斑 = 波法线曲率（与波纹严格对齐），折射位移基值同水面版
+			// 高斯曲率版（旋转不变 = 网状，同水面版）
+			vec2 ucp0 = vec2(uWp.x, uWp.z * 0.8);
+			float uwaveT2 = frameTimeCounter * 0.6;
+			float uE2 = 1.0;
+			float uhh0 = waterHeightField(ucp0, uwaveT2);
+			float uhhXp = waterHeightField(ucp0 + vec2(uE2, 0.0), uwaveT2);
+			float uhhXm = waterHeightField(ucp0 - vec2(uE2, 0.0), uwaveT2);
+			float uhhZp = waterHeightField(ucp0 + vec2(0.0, uE2), uwaveT2);
+			float uhhZm = waterHeightField(ucp0 - vec2(0.0, uE2), uwaveT2);
+			float uhhPP = waterHeightField(ucp0 + vec2(uE2, uE2), uwaveT2);
+			float uhhPM = waterHeightField(ucp0 + vec2(uE2, -uE2), uwaveT2);
+			float uhhMP = waterHeightField(ucp0 + vec2(-uE2, uE2), uwaveT2);
+			float uhhMM = waterHeightField(ucp0 - vec2(uE2, uE2), uwaveT2);
+			float uhhxx = (uhhXp - 2.0 * uhh0 + uhhXm) / (uE2 * uE2);
+			float uhhzz = (uhhZp - 2.0 * uhh0 + uhhZm) / (uE2 * uE2);
+			float uhhxz = (uhhPP - uhhPM - uhhMP + uhhMM) / (4.0 * uE2 * uE2);
+			float ucau = clamp(pow(sqrt(abs(uhhxx * uhhzz - uhhxz * uhhxz)) * uampW * 12.0, 1.8), 0.0, 2.0);
+			float uAtten = exp(-length(viewPosFromDepth(d, texcoord)) * 0.12);
+			cauAddCol = color * vec3(1.0, 0.9, 0.72);
+			cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
+			cauAddAmt *= upF; // 朝向渐变：缓坡光斑渐弱
+			color += cauAddCol * cauAddAmt;
+		}
 	}
 	// ===== 手持光源（玩家手持光源方块照亮周围） =====
 	// heldBlockLightValue（OptiFine 兼容 uniform，Iris 支持）：主/副手
