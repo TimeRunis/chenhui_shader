@@ -33,7 +33,20 @@ uniform sampler2D shadowtex0;
 uniform sampler2D shadowtex1;
 
 // 临时诊断（用后删除）：1 = ndl/sh/df 分解，2 = 最终太阳贡献，0 = 关闭
+// 3 = sh 直显（白=受光判定 黑=阴影判定）——受光面阴影定位
 #define DEBUG_SUNTERM 0
+
+// 临时调试：沙子方块边缘亮边定位（用后删除）。逐项关闭光照组件，
+// 观察亮边是否消失以确定来源：
+// 1 = A 关 direct（太阳/月光/方块光全去，只留天光乘法）
+// 2 = B 关 shadow（sh 恒受光 1.0，阴影/天光阴影修正全消失）
+// 3 = C 关 specular（smoothness=0）
+// 4 = D 关 ambient（skyVis=0；本包无 SSAO，此为本包唯一环境光项）
+// 5 = E 关 dither（shadow z 抖动与 PCF 旋转 dither 恒 0）
+// 6 = 分屏：左半正常、右半关 shadow（sh=1）——一眼对比亮边归属
+// 7 = 分屏：左半正常、右半关 direct（太阳/月光/方块光全去）
+// 0 = 关闭
+#define DEBUG_EDGE 0
 
 // 预曝光系数：gbuffers 输出 colortex0（RGBA16F，半浮点，见 composite1 的
 // colortex0Format 声明）。16F 精度 ~0.0005，0~1 漫反射与 HDR 高光（萤石
@@ -106,102 +119,109 @@ float dayFactorF() {
 }
 
 // ===== 阴影采样 =====
-// 深度约定（debug 13/14 数据定论）：
-// shadowtex0 = gl_FragCoord.z 直接输出 = 标准深度（近=0 远=1）；
-// shadowProjection 输出反向 NDC（近=1）→ p.z 需转标准再比较。
-// 受光：d + bias > 1.0 - p.z（d ≈ 1-p.z 容差内受光；遮挡物更近
-// = d 更小 → 判阴影）。shadowtex1 硬件比较实测恒受光（方向不可
-// 控），回到手动比较 shadowtex0。
+// Derivative Main 数学工具（lib/Head/Common.inc）
+#define transMAD(m, v) (mat3(m) * (v) + (m)[3].xyz)
+#define projMAD(m, v) (vec3((m)[0][0], (m)[1][1], (m)[2][2]) * (v) + (m)[3].xyz)
+
+// 四范数（(x⁴+y⁴)^(1/4)，Derivative ShadowDistortion 的 quarticLength）
+float quarticLength(vec2 v) {
+	float x2 = v.x * v.x;
+	float y2 = v.y * v.y;
+	return sqrt(sqrt(x2 * x2 + y2 * y2));
+}
+
+// 深度约定（2026-08-13 Derivative 移植后）：
+// shadow pass 与采样端同用 ShadowDistortion（xy 畸变 + z×0.2 压缩）——
+// 有效深度 ∈ [0, 0.2]（近 0 远 0.2），空区 clear=1.0 恒判受光。
+// shadowtex1 = 仅不透明深度（水面不遮挡水底）；Iris 1.7.2 硬件比较
+// 实测恒受光（方向不可控），手动采样比较：d + bias > pz 判受光。
 // taps: 0=无阴影 1=单采样 2=2x2 PCF
-// n: 表面法线（眼空间），用于斜率偏移（slope scale bias）——
-// 表面与阳光方向掠射（法线⊥光线）时自阴影误差最大，
-// 偏移必须随之增大，否则斜坡/墙面交界出现阴影痤疮（"脏泥巴"边缘）
+// n: 表面法线（眼空间），经 gbufferModelViewInverse 转世界法线后
+// 用于 Derivative 式法线偏移（受光面小偏移、背光面大偏移防 acne）
 float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	if (taps <= 0) return 1.0;
-	// Iris 的 shadowModelView 接收"相对主相机"坐标（Derivative
-	// deferred5: worldPos = mat3(gbufferModelViewInverse)×viewPos，
-	// 不含 cameraPosition）——传相对坐标，否则偏移 cameraPosition
-	// 导致投影全部越界（debug 15 青色 = 全受光的根因）
-	// 深度偏移沿太阳方向（光照空间纯深度 bias，防 acne）：
-	// 旧版沿世界法线推接收面（Derivative normalOffset 适配）——背光面
-	// ndl=0 偏移最大（0.15 格）且方向背向太阳，在阴影图中产生屏幕位移
-	// （≈1.6~3 texel）。高太阳角时顶面在阴影图里的投影带只有
-	// cosθ≈0.17 格高，背光面采样点被推出投影带 → 采样到背景（判受光）
-	// → "背光面只有下缘约 1/4 阴影（半圆形）"的根因。沿太阳轴偏移
-	// 是纯深度变化（正交相机下屏幕坐标不变）：采样点永远留在方块
-	// 自身轮廓内，背光面稳定读到顶面遮挡判阴影；受光面深度变浅
-	// 获得 acne 容差——两种目的同时成立，且无屏幕位移
+	// ===== Derivative Main 阴影移植（SunLighting.glsl + ShadowDistortion.glsl
+	// + deferred5.fsh normalOffset，2026-08-13） =====
+	// ① Iris 的 shadowModelView 接收"相对主相机"坐标——传相对坐标，
+	// 否则偏移 cameraPosition 导致投影全部越界
 	vec3 relPos = worldPos - cameraPosition;
-	float ndlC = clamp(dot(n, sunDirV()), 0.0, 1.0);
-	// 偏移沿 +sunDirW（推向太阳，深度变浅 = 受光侧容差）——
-	// 旧版误用 -sunDirW（背向太阳，深度变深）：受光面自身图深度
-	// 浅于采样点 → 受光面全部误判阴影（"方块正面出现阴影"、
-	// "白天整体变暗"的根因），且背光面"全阴影"只是方向错误的巧合。
-	// 偏移量按受光程度缩放（0.03 + 0.09×ndl）：
-	// 背光面（ndl=0）只给 0.03 格——顶穿亮带 ≈ bias/(sinθ+cosθ)
-	// ≈ 面高 2%（亚像素不可见），且背光面不需要 acne 容差（本就
-	// 深阴影）；正对太阳的面（ndl=1）给 0.12 格防 acne（受光面
-	// 顶穿无害：采样点在自身与太阳之间，深度仍浅于自身图 → 判受光）
-	vec3 nOff = sunDirW() * (0.03 + 0.09 * ndlC);
-	vec4 sp = shadowProjection * shadowModelView * vec4(relPos + nOff, 1.0);
-	if (sp.w <= 0.0) return 1.0;
-	vec3 p = sp.xyz / sp.w * 0.5 + 0.5;
-	// 只检查 xy 越界；p.z 不设 [0,1] 限制——Iris 1.7.2 的
-	// shadowProjection 输出反向 NDC（近处 p.z 可达 1.0），
-	// 旧版 p.z >= 1.0 → return 1.0 会把近处全部排除（全受光）
+	// ② 法线偏移（Derivative deferred5 L251 原式）：
+	// worldNormal × (dist²×8e-5 + 0.03) × (2 - saturate(NdotL))
+	// 沿世界法线推接收面——正对太阳的面（NdotL≈1）偏移最小（受光面
+	// 自投影容差，不把自身误判阴影）、背光面（NdotL→0）偏移最大
+	// （acne 容差）；偏移随距离平方增长（远处阴影图精度低需更大容差）
+	vec3 worldNormal = normalize(mat3(gbufferModelViewInverse) * n);
+	float ndlW = clamp(dot(worldNormal, sunDirW()), 0.0, 1.0);
+	float dist2 = dot(relPos, relPos);
+	vec3 nOff = worldNormal * (dist2 * 8e-5 + 0.03) * (2.0 - ndlW);
+	// ③ 投影 + 畸变（ShadowDistortion 原式，与 shadow.vsh 渲染端一致）：
+	// xy 四范数畸变（中心纹素密度更高）、z×0.2 深度压缩（精度×5）。
+	// 深度语义：渲染端 gl_FragCoord.z = clip.z×0.2 归一化（近 0 远 0.2），
+	// 采样端 p.z 同变换；空区 clear=1.0 恒 > 有效深度 → 恒判受光 ✓
+	vec3 clipPos = transMAD(shadowModelView, relPos + nOff);
+	clipPos = projMAD(shadowProjection, clipPos);
+	float distortFactor = quarticLength(clipPos.xy * 1.165) * 0.9 + 0.1; // SHADOW_MAP_BIAS=0.9
+	vec3 p = clipPos * vec3(vec2(1.0 / distortFactor), 0.2) * 0.5 + 0.5;
 	if (p.x < 0.0 || p.x > 1.0 || p.y < 0.0 || p.y > 1.0) return 1.0;
-	// 阴影图边缘淡出：UV 接近边界时阴影权重平滑降到 0，
+	// 阴影图边缘淡出（晨辉保留）：UV 接近边界时阴影权重平滑降到 0，
 	// 消除 shadowDistance 边缘"阴影突然消失"的方形硬切
 	vec2 uvFade = smoothstep(0.0, 0.04, p.xy) * smoothstep(1.0, 0.96, p.xy);
 	float fade = uvFade.x * uvFade.y;
-	// ===== PCSS 动态半影 + Poisson PCF（Derivative Main 移植） =====
-	// BlockerSearch（deferred5 L257）：8 采样搜索遮挡物平均深度 →
-	// 半影比例 = 遮挡物相对距离（遮挡物远 = 半影宽、近 = 半影窄，
-	// 物理半影形状）→ PCF 半径 1~4 texel（Derivative 原上限 21 texel
-	// 无 TAA 会噪点明显，缩小适配）；无遮挡区 = 1 texel（轮廓清晰）
-	// Poisson 螺旋采样（SunLighting PercentageCloserFilter）：16/8
-	// 采样 + 每像素 dither 旋转（InterleavedGradientNoise 结构化噪声，
-	// pattern 度低于纯随机）→ 半影连续无固定网格台阶（"多影"根因）
-	// z 微抖动（Derivative：shadowProjPos.z -= 1e-4 - dither*5e-5）
-	// 防 acne；手动比较 shadowtex1（仅不透明深度，水面不遮挡水底）。
-	// Iris 硬件比较方向不可控实测恒受光，改手动采样比较
+	// ④ PCSS blocker（Derivative BlockerSearch 原式）：8 采样螺旋、
+	// 半径 2×shadowProjection[0].x（clip 空间 texel）、weight = step(遮挡, p.z)
+	// （Derivative 用遮挡深度 ≤ p.z 计入平均；自身面（==p.z）weight=1 但
+	// 半影比例 = 2×(pz-blocker)/blocker ≈ 0 无放大）
 	float shadowRes = float(textureSize(shadowtex1, 0).x);
+	#if DEBUG_EDGE == 5
+	float dither = 0.0; // E：关 dither（z 抖动与 PCF 旋转固定）
+	#else
 	float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
+	#endif
 	float ang0 = dither * 6.2831853;
-	// PCSS：遮挡物搜索（8 采样螺旋，半径 3 texel）
 	float searchDepth = 0.0;
 	float sumWeight = 0.0;
-	float searchRadius = 3.0 / shadowRes;
+	float searchRadius = 2.0 * shadowProjection[0].x;
 	for (int i = 0; i < 8; i++) {
 		float fi = float(i) + dither;
 		float ang = ang0 + float(i) * 0.7853981;
 		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * searchRadius * sqrt(fi * 0.125);
 		float ds = texture(shadowtex1, sampleCoord).r;
-		if (ds < p.z && ds < 0.995) { searchDepth += ds; sumWeight += 1.0; }
+		float weight = step(ds, p.z); // Derivative: step(depthSample, shadowProjPos.z)
+		searchDepth += ds * weight;
+		sumWeight += weight;
 	}
 	float blockerDepth = (sumWeight > 0.001) ? searchDepth / sumWeight : 1.0;
-	// 半影比例（遮挡物相对距离，0=无/紧贴接收面 1=远遮挡）
-	float penumbraRatio = max(min(2.0 * (p.z - blockerDepth) / max(blockerDepth, 1e-4), 1.0), 0.0);
-	// PCF 半径：比例 × 4 texel 上限，下限 2 texel——
-	// 阴影图 2048/192 格 ≈ 0.094 格/texel。3 texel 过软（"阴影太
-	// 模糊"反馈），2 texel（≈0.19 格）兼顾轮廓清晰与边缘柔化；
-	// 太阳升起时"半格半格跳动"是 5 texel 量级，与软边无关，
-	// 需另查（疑似 Iris 太阳角度更新或光照图步进）
-	float penumbra = max(penumbraRatio * 2.0, 1.0) / shadowRes; // 软边减半（原 ×4/2texel）
-	// Poisson PCF
+	float penumbraRatio = min(2.0 * (p.z - blockerDepth) / max(blockerDepth, 1e-4), 1.0);
+	// ⑤ PCF 半径（Derivative: max(blockerSearch.x / distortFactor, 2.0/res)）
+	// ——半影比例 × 投影缩放 / 畸变因子 = clip 空间半径，PCF 在 UV 空间
+	// 采样（与 Derivative 的 shadowProjPos 直接相加一致）
+	float penumbra = max(penumbraRatio * shadowProjection[0].x / max(distortFactor, 1e-4), 2.0 / shadowRes);
+	// ⑥ Poisson PCF（Derivative PercentageCloserFilter 原式）：
+	// 16/8 采样 + dither 旋转；z 微抖动（shadowProjPos.z -= 1e-4 - dither*5e-5）
+	// 防 acne。手动深度比较 shadowtex1（仅不透明深度，水面不遮挡水底）——
+	// Iris 1.7.2 硬件比较方向不可控实测恒受光，改手动采样比较（晨辉既定）
 	int smp = (taps >= 2) ? 16 : 8;
 	float pz = p.z - (1e-4 - dither * 5e-5);  // z 微抖动防 acne
 	float s = 0.0;
+	int cnt = 0;
 	for (int i = 0; i < 16; i++) {
 		if (i >= smp) break;
 		float fi = float(i) + dither;
 		float ang = ang0 + float(i) * 0.7853981;
 		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * penumbra * sqrt(fi * (1.0 / 16.0));
+		// 边界修正（2026-08-13 亮边排查）：采样点越出 shadow UV（默认
+		// REPEAT 会采到对侧无意义深度）或落在投影带空区（d>0.995 清屏）
+		// 时跳过——两者都会在遮挡边界产生错误亮采样（空区被误当受光
+		// 冲淡阴影 = 阴影边界亮边）。有效采样数归一化：投影带内必有
+		// 有效深度（p.xy 已判越界 return），cnt 恒 > 0
+		if (sampleCoord.x < 0.0 || sampleCoord.x > 1.0 || sampleCoord.y < 0.0 || sampleCoord.y > 1.0) continue;
 		float d = texture(shadowtex1, sampleCoord).r;
-		// 深度比较：受光 d + 微 bias > pz；clear 空值（d > 0.995）视为受光
-		s += (d > 0.995 || d + 1e-4 > pz) ? 1.0 : 0.0;
+		if (d > 0.995) continue;
+		// 深度比较：受光 d + 微 bias > pz
+		s += (d + 1e-4 > pz) ? 1.0 : 0.0;
+		cnt++;
 	}
-	s *= 1.0 / float(smp);
+	s = (cnt > 0) ? s / float(cnt) : 1.0;
 	return 1.0 - (1.0 - s) * fade;
 }
 
@@ -250,6 +270,11 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	vec3 sdMain = (dfL > 0.5) ? sunDirV() : moonDirV();
 	float ndlMain = clamp(dot(n, sdMain), 0.0, 1.0);
 	float sh = (ndlMain < 0.001) ? 0.0 : shadowSample(worldPos, n, shadowTaps);
+	#if DEBUG_EDGE == 2
+	sh = 1.0; // B：关 shadow（阴影判定恒受光）
+	#elif DEBUG_EDGE == 6
+	if (gl_FragCoord.x > viewWidth * 0.5) sh = 1.0; // 分屏：右半关 shadow，左半正常
+	#endif
 	float shadowAmt = 1.0 - sh;
 	// ===== 光照图正确提取（OptiFine 布局） =====
 	// r = max(天光, 方块光) 的显示亮度；g = 天光显示亮度；
@@ -282,6 +307,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 方块光超过天光的量（r−g，max 语义），skyCorr 的方块光主导
 	// 区判定与 skyNight 共用（过渡带 0~0.3 = 方块光 5.2~8 级）
 	float blockAmt = max(lm.r - lm.g, 0.0);
+	#if DEBUG_EDGE == 7
+	if (gl_FragCoord.x > viewWidth * 0.5) blockAmt = 0.0; // 分屏：右半关 direct（方块光部分）
+	#endif
 	// 天光阴影修正：阴影处天光 ×(1-0.5×shadowAmt×df)——太阳阴影
 	// 可见性的来源（阴影区天光减半 + 无太阳项，与受光区拉开对比；
 	// 隔离测试证实恒 1.0 会让阴影几乎不可见）。
@@ -294,7 +322,15 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 阴影"根因（隔离测试确认）；直接移除保护则火把区天光被阴影
 	// 压暗（"光源无法减弱阴影"）——宽过渡兼得两者
 	float blockLightK = 1.0 - smoothstep(0.0, 0.3, blockAmt);
-	float skyCorr = 1.0 - 0.65 * shadowAmt * df * blockLightK;
+	// 天光阴影修正（2026-08-13 参考 Derivative Main 重构 + 可见性平衡）：
+	// Derivative 的阴影只乘在太阳直射上，天光由光照图独立表达——但
+	// 晨辉直射强度 0.25 低于 Derivative 的 SUNLIGHT_INTENSITY，纯直射
+	// 差阴影过淡（用户反馈"阴影强度太低"）。系数 0.35 温和衰减阴影区
+	// 天光（×0.65）：开阔地阴影对比 = 直射消失 + 天光 35% 衰减（可
+	// 见但不过黑）；低角度太阳受光面下半（顶面自投影区，lm.g 高）
+	// 天光 ≈0.63 保留——"微暗受光"而非黑阴影（保留 Derivative 模型的
+	// 主要效果）。系数可调范围 0.3~0.5（更高阴影更黑）
+	float skyCorr = 1.0 - 0.35 * shadowAmt * df * blockLightK * skyLm;
 	// 夜晚低光衰减（按天光 g 平滑 0.25~0.5）：方块光已完全走加法
 	// （不衰减——多光源缝隙亮、萤石四周无阴影圈），只有天光需要
 	// 夜晚变暗（月光 0.267→0.083，"夜晚接近黑色"）。按 g 连续无
@@ -309,6 +345,10 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float skyNight = nightK;
 	// 天光：乘法（物理着色——albedo 色相与纹理保留，圆石颗粒清晰）
 	vec3 color = albedo * vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df);
+	#if DEBUG_EDGE == 1
+	// A：关 direct——只留天光乘法（太阳/月光/方块光全去）
+	return color;
+	#endif
 	// 方块光：乘法式合成——albedo×[0.85 中性白 + 0.15 暖橙]
 	// （"材质颜色 × 光照颜色"，物理着色）：灰色圆石×暖光 = 暖灰，
 	// 纹理明暗保留；不再把纯光源色直接加到最终 RGB。
@@ -335,6 +375,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 色调来自"没有太阳光"而非整体混色（色调由此处实现）
 	float rainAtten = 1.0 - 0.9 * wetness;
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
+	#if DEBUG_EDGE == 7
+	if (gl_FragCoord.x > viewWidth * 0.5) ndl = 0.0; // 分屏：右半关 direct（太阳项）
+	#endif
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
 	color += albedo * vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
 	// ===== 临时诊断：太阳直射项分解（DEBUG_SUNTERM，用后删除） =====
@@ -362,6 +405,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 门控用衰减后的天光 sky：夜晚户外 0.04×12≈0.48 半开、洞穴≈0 关闭、
 	// 白天被 (1.0 - df) 关掉——不覆盖材质，只留一丝轮廓
 	float skyVis = clamp(sky * 12.0, 0.0, 1.0);
+	#if DEBUG_EDGE == 4
+	skyVis = 0.0; // D：关 ambient（本包唯一环境光项；无 SSAO）
+	#endif
 	// 暗部冷色调环境光：AMBIENT_LIGHT_STRENGTH 强度（0.20 基线 + 法线
 	// 朝上略亮）——夜晚暗部呈蓝紫氛围，与月光直射面冷暖对比。
 	// 阴影区域环境光再衰减 50%：ambient 不覆盖 shadow，
@@ -371,6 +417,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 太阳高光（Blinn-Phong）
 	// shiny 上限 150、强度 1.1：水面高光更宽更柔——过窄的高光在波浪流动时
 	// 亮点满水面乱跳（"光斑随视角变化"的观感），且 1.5 强度会把反射点过曝成白斑
+	#if DEBUG_EDGE == 3
+	smoothness = 0.0; // C：关 specular
+	#endif
 	float shiny = 6.0 + smoothness * smoothness * 150.0;
 	vec3 h = normalize(sd + viewDir);
 	float ndh = clamp(dot(n, h), 0.0, 1.0);
