@@ -128,11 +128,11 @@ void main() {
 	float df = dayFactorF();
 	vec3 color = calcLight(albedo, n, lmcoord, viewDir, worldPos, 0.92, 0.0, 0.0, SHADOW_QUALITY);
 
-	// 水面透明度写入 alpha = 0.65（原版水面纹理级别）——恢复真实
-	// 水面的半透明状，透出 35% 水底材质：浅水区能看清水底颜色，
-	// 深水区透出的仍是远处水底（暗）。SSR 已排除水下命中，水底
-	// 只经透射显示，不再被误反射泛白
-	fragOut0 = vec4(color * PRE_EXPOSURE, 0.65);
+	// 水面 alpha = 0.0（Derivative 式）：水色不再写入 gbuffer，水面
+	// 像素 = 水底颜色 100% 透出。水体透明度改由 composite1 按水深
+	// 指数混合（浅水全透、深水渐变为水色），不再全局常数 alpha
+	// （原 0.325/0.65）
+	fragOut0 = vec4(color * PRE_EXPOSURE, 0.0);
 	fragOut2 = vec4(albedo, 1.0);
 	// 水面深度 + 材质标志写入 colortex1：
 	// r = 水面片元深度（非线性 d，composite1 的 SSR 用它重建反射起点

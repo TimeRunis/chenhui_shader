@@ -264,8 +264,9 @@ void main() {
 		// 眼睛在水下时不做 SSR：水下抬头视线从下往上穿过水面，
 		// 反射方向 R=reflect(viewDir,nV) 朝下回到水里——SSR 会在
 		// 水下找"反射内容"（物理错误：水下看水面是透射看天空，
-		// 不是反射）。跳过 SSR 后水面显示 gcolor 混合内容
-		// （水色×0.65 + 35% 透过的水下景物/天空）
+		// 不是反射）。跳过 SSR 后水面显示 gcolor 内容（alpha=0
+		// 后 = 透过的水下景物/天空，水下蓝色由 UNDERWATER_FOG/
+		// fogUnder 提供）
 		// 水面识别（v3 材质标志）：colortex1.b = 水面材质标志——
 		// gbuffers_water 显式写 1.0，其余所有 gbuffers 程序显式写
 		// 0.0（写 a=1 保证 blend 程序下也确定性覆盖）。不再用
@@ -301,7 +302,10 @@ void main() {
 					vec4 bottomCol = texture(colortex3, texcoord);
 					float wdLin = linDepth(dbgWd);
 					float bdLin = linDepth(bottomCol.r);
-					float waterDepth = max(bdLin - wdLin, 0.0);
+					// 水底深度无效（colortex3.r=0 清屏：远处水面/天空底）
+					// 视为深水 64 格 → 全水色。原 max() 会把远处水面判成
+					// 水深 0 = 全透 = 显示天空（"远处水面没有蓝色"）
+					float waterDepth = (bottomCol.r > 0.001 && bdLin > wdLin + 0.01) ? (bdLin - wdLin) : 64.0;
 					// 近岸淡入（接缝处水深≈0 时衰减为 0，消除水面-方块接缝过亮）
 					float cauAtten = exp(-waterDepth * 0.35) * smoothstep(0.0, 0.35, waterDepth);
 					// 光斑锚定在水底世界坐标（从水底深度重建）——图案跟随
@@ -339,8 +343,10 @@ void main() {
 					float chzz = (chZp - 2.0 * ch0 + chZm) / (cauE * cauE);
 					float chxz = (chPP - chPM - chMP + chMM) / (4.0 * cauE * cauE);
 					float cau = clamp(pow(sqrt(abs(chxx * chzz - chxz * chxz)) * ampW * 12.0, 1.8), 0.0, 2.0); // e=1.0 重校准增益 // 窗口放宽：光斑更大更亮
-					// 暖色阳光染在底面上 = 被照亮；旧版直接放大底面本色 = 发光感
-					cauAddCol = bottomCol.gba * vec3(1.0, 0.9, 0.72) * (1.0 / PRE_EXPOSURE) * 0.35;
+					// 暖色阳光染在底面上 = 被照亮；旧版直接放大底面本色 = 发光感。
+					// 透出系数 0.35 → 0.6：alpha=0 后水底 100% 透出（原 35%），
+					// 但基础色已随透出比例变亮，增量按 0.6 防光斑过曝（嫌暗可调）
+					cauAddCol = bottomCol.gba * vec3(1.0, 0.9, 0.72) * (1.0 / PRE_EXPOSURE) * 0.6;
 					// 基础照明 0.10（浅水水底轻微提亮）；光斑只取聚焦增量
 					// max(cau−0.3, 0)：Derivative 公式未聚焦基线 =0.3，减去后
 					// 剩下纯聚焦亮线——不再整片均匀提亮（"发光"感的来源）
@@ -352,6 +358,21 @@ void main() {
 				// 光斑在反射混合前应用：只落在水底（反射层覆盖其上），
 				// 不再把反射内容一起提亮（旧版光斑浮在水面的根因）
 				color += cauAddCol * cauAddAmt;
+				// ===== 水体透明度（Derivative 式深度指数吸收） =====
+				// gbuffers_water alpha=0：水色不在 gbuffer 混合，水面
+				// 像素 = 水底 100% 透出。这里按水深指数混入水色：
+				// transmittance = exp(-0.1×水深)，浅水几乎全透（水底
+				// 直接可见）、深水渐变为水色（k=0.1 对齐 Derivative
+				// 最透的蓝通道 ≈0.11：1 格透 ~90%、2 格 ~82%、5 格
+				// ~61%、10 格 ~37%——平视可见更深的水底。原 k=0.3
+				// 衰减过快，2 格外就"全是浅蓝"）。
+				// 水雾色 = 深蓝（用户要求：深水处不要浅蓝）× 天光（dfFog），
+				// 夜晚自然变暗。放在 SSR 之前：水雾作用于水底透射部分，
+				// 反射在表面之上不受吸收（Derivative 同序：WaterFog 作用
+				// diffuse，specular 反射独立叠加）
+				float waterTrans = exp(-0.1 * waterDepth);
+				vec3 waterFogCol = vec3(0.12, 0.25, 0.45) * (0.18 + 0.82 * dfFog);
+				color = mix(waterFogCol, color, waterTrans);
 
 			vec3 R = reflect(viewDir, nV);
 			// 不限制反射方向：平视/微俯看远处水面时反射方向朝上
@@ -593,12 +614,28 @@ void main() {
 					dbgMinStepRatio = float(totalMinStep) / max(float(totalSteps), 1.0);
 					dbgHitF = float(hitCount); // 供 debug 16 在块外判断最终 miss
 					dbgSsrCol = refl;
-					// 菲涅尔反射率：俯视 0.45、掠射 0.9（用户选择增强——
-					// 俯视时附近方块/光源/日月反射明显可见，掠射近全反射）
-					float reflK = 0.45 + 0.45 * pow(1.0 - dot(-viewDir, nV), 3.0);
-					// Fresnel 权重（本轮保持原值，SSR-3 再重构）：
-					// 俯视 0.45、掠射 0.9。miss 时反射内容已是弱 fallback，
-					// 权重不再决定"天空镜面"强度
+					// 菲涅尔反射率（Derivative 同款 Schlick 曲线，f0=0.08
+					// 折中）：物理水 f0≈0.02 时俯视反射几乎消失（Derivative
+					// 垂直 ≈2%）——用户历史要求"俯视反射可见"，保留 8%
+					// 起步（原 45%），掠射仍 →100%。
+					// 白天单向玻璃（用户修正版）：衰减只作用于近处水面
+					// （俯视 NdotV→1，外部天光亮 → 反射压弱、水底透明，
+					// ×0.15）；远处水面（掠射 NdotV→0）保持 Fresnel 原
+					// 强度（远处镜面）。
+					// 夜晚反射与月光联动（灵敏度提高 + 整体强度下调，用户
+					// 要求）：moonK = (1−dfFog)×MOON/1000，nightBoost =
+					// 0.35+1.9×moonK——无月光反射极弱（基准 0.35）、
+					// MOON 1000 夜晚俯视 ≈14%（原 ≈22%，清晰度降低）、
+					// MOON 2000 ≈25%；低月光段掉得更快（500→1000 反射
+					// ×1.7）。白天（dfFog=1）nightBoost=1.0，远处反射
+					// 不衰减（mix 平滑过渡）
+					float NdotVw = max(dot(-viewDir, nV), 1e-4);
+					float reflK = 0.08 + 0.92 * pow(1.0 - NdotVw, 5.0);
+					float dayAtten = mix(1.0, 0.15, dfFog * NdotVw);
+					float moonK = (1.0 - dfFog) * (MOON_STRENGTH / 1000.0);
+					float nightBoost = 0.35 + 1.9 * moonK;
+					reflK *= dayAtten * mix(nightBoost, 1.0, dfFog);
+					reflK = min(reflK, 0.9);
 					dbgSsrW = reflK;
 					// 临时调试（debug 20/23）：SSR 合成前基础色与合成最终
 					dbgSsrBase = color;
