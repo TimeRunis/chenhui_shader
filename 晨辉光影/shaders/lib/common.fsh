@@ -26,7 +26,14 @@ uniform int worldTime;
 
 uniform sampler2D lightmap;
 uniform sampler2D shadowtex0;
-uniform sampler2DShadow shadowtex1; // Iris 硬件深度比较纹理（Derivative 同款用法）
+// shadowtex1 = Iris 的"仅不透明深度"图（不含半透明物，如水面）。
+// 用 sampler2D 声明手动采样深度值（Iris 硬件深度比较方向不可控
+// 实测恒受光）；shadowSample 用手动比较，采 shadowtex1 让水面
+// 不再作为遮挡物——水底恢复太阳直射（"水面挡水底阴影"修复）
+uniform sampler2D shadowtex1;
+
+// 临时诊断（用后删除）：1 = ndl/sh/df 分解，2 = 最终太阳贡献，0 = 关闭
+#define DEBUG_SUNTERM 0
 
 // 预曝光系数：gbuffers 输出 colortex0（RGBA16F，半浮点，见 composite1 的
 // colortex0Format 声明）。16F 精度 ~0.0005，0~1 漫反射与 HDR 高光（萤石
@@ -156,9 +163,9 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	// 采样 + 每像素 dither 旋转（InterleavedGradientNoise 结构化噪声，
 	// pattern 度低于纯随机）→ 半影连续无固定网格台阶（"多影"根因）
 	// z 微抖动（Derivative：shadowProjPos.z -= 1e-4 - dither*5e-5）
-	// 防 acne；手动比较 shadowtex0（Iris 1.7.2 shadowtex1 硬件比较
-	// 实测恒受光不可用）
-	float shadowRes = float(textureSize(shadowtex0, 0).x);
+	// 防 acne；手动比较 shadowtex1（仅不透明深度，水面不遮挡水底）。
+	// Iris 硬件比较方向不可控实测恒受光，改手动采样比较
+	float shadowRes = float(textureSize(shadowtex1, 0).x);
 	float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
 	float ang0 = dither * 6.2831853;
 	// PCSS：遮挡物搜索（8 采样螺旋，半径 3 texel）
@@ -169,7 +176,7 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 		float fi = float(i) + dither;
 		float ang = ang0 + float(i) * 0.7853981;
 		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * searchRadius * sqrt(fi * 0.125);
-		float ds = texture(shadowtex0, sampleCoord).r;
+		float ds = texture(shadowtex1, sampleCoord).r;
 		if (ds < p.z && ds < 0.995) { searchDepth += ds; sumWeight += 1.0; }
 	}
 	float blockerDepth = (sumWeight > 0.001) ? searchDepth / sumWeight : 1.0;
@@ -190,7 +197,7 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 		float fi = float(i) + dither;
 		float ang = ang0 + float(i) * 0.7853981;
 		vec2 sampleCoord = p.xy + vec2(cos(ang), sin(ang)) * penumbra * sqrt(fi * (1.0 / 16.0));
-		float d = texture(shadowtex0, sampleCoord).r;
+		float d = texture(shadowtex1, sampleCoord).r;
 		// 深度比较：受光 d + 微 bias > pz；clear 空值（d > 0.995）视为受光
 		s += (d > 0.995 || d + 1e-4 > pz) ? 1.0 : 0.0;
 	}
@@ -322,6 +329,14 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float ndl = clamp(dot(n, sd), 0.0, 1.0);
 	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
 	color += albedo * vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
+	// ===== 临时诊断：太阳直射项分解（DEBUG_SUNTERM，用后删除） =====
+	// 档 1：R=ndl（法线×太阳方向）G=sh（阴影判定）B=df（天光因子）
+	// 档 2：R=最终太阳贡献（含全部因子，灰度：albedo×0.25×SUN×ndl×sh×df×(0.35+0.65×skyLm)×rainAtten）
+	#if DEBUG_SUNTERM == 1
+	return vec3(ndl, sh, df);
+	#elif DEBUG_SUNTERM == 2
+	return vec3(0.25 * (SUN_STRENGTH / 100.0) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten);
+	#endif
 	// 月光
 	vec3 md = moonDirV();
 	float ndm = clamp(dot(n, md), 0.0, 1.0);

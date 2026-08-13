@@ -97,6 +97,8 @@ void main() {
 	// caustics 延迟应用：HDR 压缩后再加亮，亮线不拖累整像素被压暗
 	vec3 cauAddCol = vec3(0.0);
 	float cauAddAmt = 0.0;
+	// 水下太阳阴影判定（增强块计算，光斑块复用——阴影处排除光斑）
+	float uShUnder = 1.0;
 	// 临时调试统计（debug 16/17，验证 A/B 用，不改变正式行为；验证后可删）
 	float dbgMissReason = 0.0; // SSR miss 原因（debug 16 灰度）：0=无miss 1=步数耗尽 2=ray低于水面break 3=出屏 4=z饱和区耗尽 5=其他
 	float dbgMinStepRatio = 0.0; // 1px 最小步长占比 0~1（debug 17 R）
@@ -137,12 +139,43 @@ void main() {
 	// 雾浓度峰值：白天 0.30、夜晚 0.08——浓度大幅下调，
 	// 远景地形轮廓保留更多层次，不被雾染灰
 	float fogAmt = 0.08 + 0.22 * dfFog;
-	if (d > 0.9995 && (dist > far * 0.98 || dist > fogEnd)) {
+	// 水下看天空（isEyeInWater>0.5 且像素是水面 colortex1.b=1 且背后
+	// 是不透明深度快照 = 天空 colortex3.r=1.0——水面像素的 depthtex0
+	// 是水面深度，走不了上面的 d>0.9995）：也画程序化天空（太阳/
+	// 月亮/云）+ 折射波纹 + 丁达尔光束，否则显示原版 skybasic 的
+	// gl_Color（夜晚黑、无太阳云细节）。colortex1.b 门禁排除手持
+	// 物品（gbuffers_hand 不写 colortex3 → 手背后=天空会被误判成
+	// skyUnder → 手被画成天空 = "手透明"）
+	bool skyUnder = (isEyeInWater > 0.5 && texture(colortex1, texcoord).b > 0.5
+	              && texture(colortex3, texcoord).r > 0.9995);
+	if ((d > 0.9995 && (dist > far * 0.98 || dist > fogEnd)) || skyUnder) {
 		vec3 vp = viewPosFromDepth(d, texcoord);
 		vec3 viewDir = normalize(vp);
 		// 世界空间视线（天空随世界转动，不绑定视角）
-		vec3 worldDir = normalize(mat3(gbufferModelViewInverse) * viewDir);
+		vec3 worldDir;
+		vec3 uRdU = viewDir; // 折射后视线（水下看水面；丁达尔匹配用）
+		if (skyUnder) {
+			// 水下看水面：天空采样方向 = 视线 + 波浪法线扰动——波纹
+			// 动态 + 折射扭曲感。不用 Snell refract：视窗压缩产生
+			// "头顶大圆"（中心天顶蓝/边缘地平线白），且天空内容偏移
+			// 后与屏幕太阳泛光（原位置）错位 = "圆内一个太阳、圆外
+			// 一个太阳"（用户反馈）
+			vec3 uWpU = worldPosFromView(viewPosFromDepth(d, texcoord));
+			float uAmpU = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
+			vec3 uWnU = waterNormalWorld(uWpU, uAmpU);
+			vec3 uNvU = normalize(mat3(gbufferModelView) * uWnU);
+			uRdU = normalize(viewDir + uNvU * 0.15); // 扰动幅度 0.15（波纹强度）
+			worldDir = normalize(mat3(gbufferModelViewInverse) * uRdU);
+		} else {
+			worldDir = normalize(mat3(gbufferModelViewInverse) * viewDir);
+		}
 		color = getSkyColor(worldDir, STARS / 100.0, SUN_GLOW / 100.0, SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0, float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
+		if (skyUnder) {
+			// 丁达尔：折射视线与太阳方向匹配 → 太阳光束亮光（从水下
+			// 看水面，太阳方向的水面 = 光束入口，柔和亮带而非点斑）
+			float uSmU = pow(max(dot(normalize(uRdU), sunDirV()), 0.0), 12.0);
+			color += vec3(1.0, 0.95, 0.85) * uSmU * (SUN_STRENGTH / 100.0) * 0.3;
+		}
 		// 太阳泛光：屏幕空间投影位置（盘面细节在 sky.glsl sunDetail 中世界空间绘制）
 		vec4 sunClip = gbufferProjection * vec4(sunPosition, 1.0);
 		if (sunClip.w > 0.0) {
@@ -241,6 +274,18 @@ void main() {
 	if (isEyeInWater > 0.5) {
 		float fogUnder = 1.0 - exp(-dist * 0.06);
 		color = mix(color, vec3(0.07, 0.20, 0.30), fogUnder);
+	}
+	// ===== 水下太阳阴影对比增强（用户要求加强） =====
+	// 水下地形（非水面/非天空）像素重算 sh 判定（shadowtex1，与
+	// gbuffer 阶段同一阴影源）：阴影区（sh<1）压暗、受光区不变——
+	// 水下方块/柱子的太阳投影对比加深。放在雾之后（对比最强）、
+	// 水下光斑之前（光斑聚焦亮区不受压暗影响）
+	if (isEyeInWater > 0.5 && d < 0.9995 && texture(colortex1, texcoord).b < 0.5) {
+		vec3 wpS = worldPosFromView(viewPosFromDepth(d, texcoord));
+		uShUnder = shadowSample(wpS, vec3(0.0, 1.0, 0.0), 1);
+		// 受光区压到 80%（"水底太亮"）、阴影区 56%（0.7×0.8）——
+		// 整体暗 20% 且对比保持（1.43 不变，阴影强度感知不变）
+		color *= mix(0.56, 0.8, uShUnder);
 	}
 	// ===== 逆预曝光 + HDR 软压缩（修复光斑压平与高光溢出） =====
 	// gbuffers 写入前已乘 PRE_EXPOSURE 0.62（把 HDR 压进 RGBA8 量化范围），
@@ -662,7 +707,9 @@ void main() {
 	// 水下地形/水底像素上：波法线图案仅依赖 xz（waterNormalWorld
 	// 忽略 y），同一列的水面波浪直接用于水下光斑；距离衰减按
 	// 像素距离（深水光散开）
-	if (isEyeInWater > 0.5 && d < 0.9995) {
+	if (isEyeInWater > 0.5 && d < 0.9995 && texture(colortex3, texcoord).r < 0.9995) {
+		// 背后非天空（colortex3.r<0.9995）：水下看天空的像素（背后 =
+		// 天空 1.0）不加水下光斑——光斑只落在水底地形上
 		// 朝向门控（修复：光斑只落在朝上的表面）——屏幕空间法线从
 		// 深度差分重建（邻居像素世界位置叉积）。洞穴天花板（面朝下）
 		// /侧壁不应有光斑：阳光折射只能聚焦在朝天的水底表面。
@@ -703,6 +750,7 @@ void main() {
 			cauAddCol = color * vec3(1.0, 0.9, 0.72);
 			cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
 			cauAddAmt *= upF; // 朝向渐变：缓坡光斑渐弱
+			cauAddAmt *= uShUnder; // 阴影处排除光斑（同水面版 shadowSample 门控）
 			color += cauAddCol * cauAddAmt;
 		}
 	}
@@ -877,14 +925,15 @@ void main() {
 		color = vec3(dD, pD.z, oob);
 	} else if (DEBUG_SSR == 14) {
 		// 诊断：正确太阳相机 UV 的 shadow 图内容——屏幕每个像素重建
-		// 世界位置 → 投影到太阳相机 UV → 采样 shadowtex0 灰度显示。
-		// 方块/树区域若显示为暗（有深度内容）= 方块进了 shadow 图；
-		// 若方块区域与地形一样亮（clear 1.0 反向近）= 方块未渲染进图
+		// 世界位置 → 投影到太阳相机 UV → 采样 shadowtex1 灰度显示
+		// （当前 shadowSample 判定源）。方块/树区域若显示为暗（有深度
+		// 内容）= 方块进了 shadow 图；若方块区域与地形一样亮（clear
+		// 1.0 反向近）= 方块未渲染进图
 		vec3 wpD = worldPosFromView(viewPosFromDepth(d, texcoord));
 		vec4 spD = shadowProjection * shadowModelView * vec4(wpD - cameraPosition, 1.0);
 		vec3 pD = spD.xyz / spD.w * 0.5 + 0.5;
 		if (pD.x >= 0.0 && pD.x <= 1.0 && pD.y >= 0.0 && pD.y <= 1.0) {
-			color = vec3(texture(shadowtex0, pD.xy).r);
+			color = vec3(texture(shadowtex1, pD.xy).r);
 		} else {
 			color = vec3(0.5, 0.5, 0.5); // 图外 = 中灰（与图内区分）
 		}
