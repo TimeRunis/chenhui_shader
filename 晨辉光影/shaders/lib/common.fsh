@@ -358,7 +358,10 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 亮度锚点。亮度语义不变：方块光加亮仍走 blockAmt（原版 max，
 	// 不超锚点）
 	float blockLvlX = clamp(lmUV.x * 16.0, 0.0, 15.0) / 15.0;
-	float blockWarm = smoothstep(0.0, 0.2, blockLvlX);
+	// 白天衰减：天光强时（阳光直射/开阔地）色温只留 35% 弱暖——
+	// 光源照明区的橙黄在光真正贡献的暗处（夜晚/洞穴/阴影）全量，
+	// 阳光下的地面不整片偏橙黄（"大地偏橙黄"修复）
+	float blockWarm = smoothstep(0.0, 0.2, blockLvlX) * mix(1.0, 0.35, df * skyLm);
 	vec3 color = albedo * vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df) * mix(vec3(1.0), BLOCK_LIGHT_COLOR, blockWarm);
 	#if DEBUG_EDGE == 1
 	// A：关 direct——只留天光乘法（太阳/月光/方块光全去）
@@ -393,15 +396,19 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	#if DEBUG_EDGE == 7
 	if (gl_FragCoord.x > viewWidth * 0.5) ndl = 0.0; // 分屏：右半关 direct（太阳项）
 	#endif
-	vec3 sunC = vec3(1.0, 0.92, 0.78) * 0.55;
-	color += albedo * vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
+	// 阳光色温降饱和 + 加亮（2026-08-14 用户要求）：颜色 (1.0, 0.9, 0.75)
+	// → (1.0, 0.95, 0.88)（饱和度 0.25 → 0.12 近白，受光面不偏暖黄）；
+	// 强度 0.25 → 0.30（+20%，受光面 0.94+0.30=1.24 仍在 HDR 压缩
+	// 阈值 0.85~1.25 内，颜色更白 → 压缩后不发黄）。高光 sunC 同色
+	vec3 sunC = vec3(1.0, 0.95, 0.88) * 0.55;
+	color += albedo * vec3(1.0, 0.95, 0.88) * (0.30 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten;
 	// ===== 临时诊断：太阳直射项分解（DEBUG_SUNTERM，用后删除） =====
 	// 档 1：R=ndl（法线×太阳方向）G=sh（阴影判定）B=df（天光因子）
 	// 档 2：R=最终太阳贡献（含全部因子，灰度：albedo×0.25×SUN×ndl×sh×df×(0.35+0.65×skyLm)×rainAtten）
 	#if DEBUG_SUNTERM == 1
 	return vec3(ndl, sh, df);
 	#elif DEBUG_SUNTERM == 2
-	return vec3(0.25 * (SUN_STRENGTH / 100.0) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten);
+	return vec3(0.30 * (SUN_STRENGTH / 100.0) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten);
 	#elif DEBUG_SUNTERM == 3
 	return vec3(sh); // 阴影可见性直显：白=受光(1) 黑=阴影(0)——漏光定位
 	#endif
@@ -456,7 +463,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df) * mix(vec3(1.0), BLOCK_LIGHT_COLOR, blockWarm)
 		                 + ambC * skyVis * (1.0 - 0.65 * shadowAmt) * (1.0 - df);
 		vec3 directDbg = blockAmt * BLOCK_LIGHT_COLOR * dirF
-		               + vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
+		               + vec3(1.0, 0.95, 0.88) * (0.30 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
 		               + vec3(0.45, 0.5, 0.75) * (0.06 * (MOON_STRENGTH / 100.0)) * ndm * sh * (1.0 - df) * moonK * rainAtten;
 		#if DEBUG_LIGHT == 1
 			return albedo;

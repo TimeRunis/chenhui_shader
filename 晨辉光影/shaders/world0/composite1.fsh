@@ -347,8 +347,8 @@ void main() {
 		vec3 uTransW = exp(-vec3(0.52, 0.18, 0.11) * dist); // 与雾块同系数（作用域不可达重算）
 		float ndlU = clamp(dot(vec3(0.0, 1.0, 0.0), sunDirV()), 0.0, 1.0);
 		float rainAttenU = 1.0 - 0.9 * wetness;
-		vec3 sunDirectU = albedoU * vec3(1.0, 0.9, 0.75)
-		                * (0.25 * (SUN_STRENGTH / 100.0)) * ndlU * dfU * uShUnder
+		vec3 sunDirectU = albedoU * vec3(1.0, 0.95, 0.88)
+		                * (0.30 * (SUN_STRENGTH / 100.0)) * ndlU * dfU * uShUnder
 		                * rainAttenU;
 		float ndmU = clamp(dot(vec3(0.0, 1.0, 0.0), moonDirV()), 0.0, 1.0);
 		vec3 moonDirectU = albedoU * vec3(0.45, 0.5, 0.75)
@@ -771,7 +771,7 @@ void main() {
 			float uhhxz = (uhhPP - uhhPM - uhhMP + uhhMM) / (4.0 * uE2 * uE2);
 			float ucau = clamp(pow(sqrt(abs(uhhxx * uhhzz - uhhxz * uhhxz)) * uampW * 12.0, 1.8), 0.0, 2.0);
 			float uAtten = exp(-length(viewPosFromDepth(d, texcoord)) * 0.12);
-			cauAddCol = color * vec3(1.0, 0.9, 0.72);
+			cauAddCol = color * vec3(1.0, 0.95, 0.85);
 			cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
 			cauAddAmt *= upF; // 朝向渐变：缓坡光斑渐弱
 			cauAddAmt *= uShUnder; // 阴影处排除光斑（同水面版 shadowSample 门控）
