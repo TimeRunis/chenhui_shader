@@ -784,9 +784,10 @@ void main() {
 	// 强度与范围对应放置光源：连续线性衰减（0~0.5 格满亮度、之后
 	// 每格降 1 级，火把 14 级 → 14.5 格归零）——连续无阶梯，
 	// 不产生同心圆环；中心亮度 = 等级/15 ≈ 放置光源中心。
-	// 颜色从手持物品材质提取（gbuffers_hand 把物品 albedo 写 colortex1，
-	// 此处采样屏幕物品区域亮部平均色）：火把暖橙、萤石白、灯笼橙、
-	// 海晶灯蓝白——随手持物品变化。
+	// 颜色与点光源统一（BLOCK_LIGHT_COLOR 暖橙黄，common.fsh 共享）：
+	// 手持光源与放置光源同色。不再从物品材质提取（采样色随手持物品
+	// 变化——萤石白/海晶灯蓝白，且火焰动画帧让采样逐帧抖动 → 光照
+	// 闪烁，与放置光源观感不统一）。
 	// 材质响应：手持光乘 gbuffers 写入 colortex2 的 albedo——显示
 	// 亮度 = 方块光等级 × 材质颜色，与放置光源完全同构；材质纹理
 	// 清晰可见（裸加法会糊成纯色光罩：0.93 白 × 石头 0.5 = 0.47 灰白
@@ -813,35 +814,9 @@ void main() {
 		hatt *= heldLight / 15.0;
 		// 白天衰减：环境光强时手持光被淹没（放置火把白天同样不显）
 		float dayW = mix(1.0, 0.35, dfFog);
-		// 光源颜色：屏幕物品区域（右下）7×7 采样 colortex1。权重用
-		// 三通道最小值——纯色残留（水面深度 r 通道残留=偏红、旧帧
-		// 暗部）min≈0 被排除，火把火焰/萤石亮面（三通道都亮）主导，
-		// 消除偶发变红
-		vec2 px = vec2(1.0 / viewWidth, 1.0 / viewHeight);
-		vec3 lsum = vec3(0.0);
-		float wsum = 0.0;
-		for (int i = -3; i <= 3; i++) {
-			for (int j = -3; j <= 3; j++) {
-				vec2 off = vec2(0.75, 0.28) + vec2(float(i), float(j)) * viewHeight * 0.025 * px;
-				if (off.x < 0.0 || off.x > 1.0 || off.y < 0.0 || off.y > 1.0) continue;
-				vec4 c1x = texture(colortex1, off);
-			vec3 lc = vec3(c1x.r, c1x.g, c1x.a); // r/g/a = 手持物品 albedo×等级（b = 水面材质标志，不入采样）
-				float w = max(min(lc.r, min(lc.g, lc.b)) - 0.1, 0.0);
-				lsum += lc * w;
-				wsum += w;
-			}
-		}
-		vec3 lcol = vec3(1.0, 0.88, 0.65); // 回退：暖白（采样失败时不会突兀变红）
-		if (wsum > 0.01) {
-			lcol = lsum / wsum;
-			lcol = lcol / max(max(lcol.r, lcol.g), max(lcol.b, 1e-4));
-			// 色相钳制在暖白~橙带内（g∈[0.72,0.98]、b∈[0.35,0.90]），
-			// 再向暖白收敛 70%：火焰动画帧/物品摆动让采样区域内容
-			// 逐帧变化 → lcol 抖动 → 光照闪烁；更强收敛压掉抖动，
-			// 火把橙/萤石白/海晶灯蓝白的差异仍可辨
-			lcol = vec3(1.0, clamp(lcol.g, 0.72, 0.98), clamp(lcol.b, 0.35, 0.90));
-			lcol = mix(vec3(1.0, 0.85, 0.6), lcol, 0.3);
-		}
+		// 光源颜色与点光源统一（BLOCK_LIGHT_COLOR，common.fsh 共享）：
+		// 手持光源 = 放置光源同色（暖橙黄），固定色无逐帧抖动
+		vec3 lcol = BLOCK_LIGHT_COLOR;
 		float hK = LIGHT_GLOW / 100.0;
 		// 水面像素（colortex1.b 材质标志）：手持光弱加法提亮——
 		// 不 max 覆盖（否则程序水色×albedo = 绿色纯平光罩，盖掉

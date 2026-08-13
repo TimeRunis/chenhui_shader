@@ -60,6 +60,12 @@ uniform sampler2D shadowtex1;
 // 覆盖材质（0.20 → 0.12 → 0.06 → 0.025 逐级下调）
 #define AMBIENT_LIGHT_STRENGTH 0.025
 
+// 方块光（点光源）颜色：柔和橙黄（火把色系，降饱和版）。
+// 乘法式合成 albedo×光色——灰石×暖光 = 暖灰，纹理明暗保留。
+// 手持光源（composite1 手持光块）与此共享，放置/手持同色
+//（饱和度 0.65 → 0.45：b 0.35 → 0.55 向白收敛，橙黄保留但更柔和）
+#define BLOCK_LIGHT_COLOR vec3(1.0, 0.8, 0.55)
+
 // 阳光/月光强度选项（SUN_STRENGTH / MOON_STRENGTH，百分比）：
 // lib 约定"不使用选项宏"的例外——两项位于光照合成核心，由各
 // .fsh 在 include 前定义；无定义时回退 100（默认强度）
@@ -344,12 +350,21 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 物理语义：火把只增加局部方块光，不把夜间天光恢复成白天
 	float skyNight = nightK;
 	// 天光：乘法（物理着色——albedo 色相与纹理保留，圆石颗粒清晰）
-	vec3 color = albedo * vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df);
+	// 方块光照明区色温驱动 = 光照图 x 轴真实方块光等级 blockLvlX
+	//（lmUV.x = L/16，任何条件下保留——白天直射 r=g=1 顶满、阴影里
+	// 光照图天光 g 仍高，r−g 差值恒≈0 → blockAmt 驱动的色温在白天
+	// 失效，"放置光源还是白色"根因）。光源照明区域（方块光等级高）
+	// 天光基座向 BLOCK_LIGHT_COLOR 变暖；r 恒 1.0 → 色温混合不改变
+	// 亮度锚点。亮度语义不变：方块光加亮仍走 blockAmt（原版 max，
+	// 不超锚点）
+	float blockLvlX = clamp(lmUV.x * 16.0, 0.0, 15.0) / 15.0;
+	float blockWarm = smoothstep(0.0, 0.2, blockLvlX);
+	vec3 color = albedo * vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df) * mix(vec3(1.0), BLOCK_LIGHT_COLOR, blockWarm);
 	#if DEBUG_EDGE == 1
 	// A：关 direct——只留天光乘法（太阳/月光/方块光全去）
 	return color;
 	#endif
-	// 方块光：乘法式合成——albedo×[0.85 中性白 + 0.15 暖橙]
+	// 方块光：乘法式合成——albedo×[橙黄 BLOCK_LIGHT_COLOR]
 	// （"材质颜色 × 光照颜色"，物理着色）：灰色圆石×暖光 = 暖灰，
 	// 纹理明暗保留；不再把纯光源色直接加到最终 RGB。
 	// blockAmt = max(r−g, 0)：方块光超过天光的量——白天被天光盖住
@@ -360,11 +375,11 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 受光面（"圆石背光面发灰"的根因 = 加法项无方向、所有面均匀亮）
 	float dirF = (n.y > 0.0) ? mix(0.5, 1.0, smoothstep(0.0, 0.8, n.y)) : 0.35;
 	// 方块光颜色乘法式合成："材质颜色 × 光照颜色"（物理着色）——
-	// albedo×(0.85 中性白 + 0.15 暖橙) = 灰色圆石 × 暖光 → 自然暖灰，
+	// albedo×暖橙黄（BLOCK_LIGHT_COLOR）= 灰色圆石 × 橙黄光 → 自然暖黄灰，
 	// 纹理明暗按 albedo 保留（亮区亮、暗区暗）。旧版把纯光色
 	// vec3(1.0,0.5,0.25)×0.15 直接 += 到最终 RGB（不乘 albedo）=
 	// 圆石表面蒙一层半透明橙黄、材质颜色与细节被冲淡
-	color += albedo * blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF;
+	color += albedo * blockAmt * BLOCK_LIGHT_COLOR * dirF;
 	// 太阳直射：强度 0.35 → 0.25（用户反馈"沙漠沙子亮度很高"——
 	// 沙子 albedo≈(0.76,0.68,0.46)×(0.94 天光 + 0.25×ndl×...) 全天
 	// 受光面 ≈1.1×albedo 压进 HDR 压缩边缘发白；0.25 保留阳光方向感
@@ -438,9 +453,9 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	color += albedo * emissive * 0.45;
 	// ===== 临时 DEBUG_LIGHT：光照链路分解（验证后删） =====
 	#if DEBUG_LIGHT > 0
-		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df)
+		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df) * mix(vec3(1.0), BLOCK_LIGHT_COLOR, blockWarm)
 		                 + ambC * skyVis * (1.0 - 0.65 * shadowAmt) * (1.0 - df);
-		vec3 directDbg = blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF
+		vec3 directDbg = blockAmt * BLOCK_LIGHT_COLOR * dirF
 		               + vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
 		               + vec3(0.45, 0.5, 0.75) * (0.06 * (MOON_STRENGTH / 100.0)) * ndm * sh * (1.0 - df) * moonK * rainAtten;
 		#if DEBUG_LIGHT == 1
