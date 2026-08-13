@@ -27,7 +27,7 @@ float waterHeightField(vec2 p2, float wavesTime) {
 // 世界空间水面法线（y 向上），amp 为振幅（由 波浪强度 选项驱动，
 // 对应 Derivative WATER_WAVE_HEIGHT）
 vec3 waterNormalWorld(vec3 p, float amp) {
-	float wavesTime = frameTimeCounter * 1.2;
+	float wavesTime = frameTimeCounter * 2.4; // 频率加倍（用户要求波动更活跃）
 	vec2 p2 = p.xz;
 	p2.y *= 0.8;
 	// Derivative GetWavesNormal：center/left/up 三点高度差分

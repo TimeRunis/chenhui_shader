@@ -187,7 +187,7 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	// 模糊"反馈），2 texel（≈0.19 格）兼顾轮廓清晰与边缘柔化；
 	// 太阳升起时"半格半格跳动"是 5 texel 量级，与软边无关，
 	// 需另查（疑似 Iris 太阳角度更新或光照图步进）
-	float penumbra = max(penumbraRatio * 4.0, 2.0) / shadowRes;
+	float penumbra = max(penumbraRatio * 2.0, 1.0) / shadowRes; // 软边减半（原 ×4/2texel）
 	// Poisson PCF
 	int smp = (taps >= 2) ? 16 : 8;
 	float pz = p.z - (1e-4 - dither * 5e-5);  // z 微抖动防 acne
@@ -240,8 +240,16 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	float df = dayFactorF();
 	vec3 sd = sunDirV();
 	// 定向阴影（原始 0=全阴影 1=全亮）：shadowSample 在太阳相机空间做
-	// 深度比较，只计算太阳方向上的遮挡——阴影永远有明确方向
-	float sh = shadowSample(worldPos, n, shadowTaps);
+	// 深度比较，只计算太阳方向上的遮挡——阴影永远有明确方向。
+	// 背光面（背离主光）强制全阴影：太阳/月亮物理上永远照不到背面。
+	// 背光面部分像素的阴影图 UV 落主体投影带外 → 误判受光 → 天光
+	// 漏光（"背光面梯形阴影"——锐利模式暴露，PCF 软边曾掩盖）。
+	// 强制 sh=0 不乘黑：direct 已被下方 ndl=0 乘掉，这里只压天光
+	//（skyCorr 阴影区 35%）与月光，保留合理环境光
+	float dfL = df;
+	vec3 sdMain = (dfL > 0.5) ? sunDirV() : moonDirV();
+	float ndlMain = clamp(dot(n, sdMain), 0.0, 1.0);
+	float sh = (ndlMain < 0.001) ? 0.0 : shadowSample(worldPos, n, shadowTaps);
 	float shadowAmt = 1.0 - sh;
 	// ===== 光照图正确提取（OptiFine 布局） =====
 	// r = max(天光, 方块光) 的显示亮度；g = 天光显示亮度；
@@ -286,7 +294,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 阴影"根因（隔离测试确认）；直接移除保护则火把区天光被阴影
 	// 压暗（"光源无法减弱阴影"）——宽过渡兼得两者
 	float blockLightK = 1.0 - smoothstep(0.0, 0.3, blockAmt);
-	float skyCorr = 1.0 - 0.5 * shadowAmt * df * blockLightK;
+	float skyCorr = 1.0 - 0.65 * shadowAmt * df * blockLightK;
 	// 夜晚低光衰减（按天光 g 平滑 0.25~0.5）：方块光已完全走加法
 	// （不衰减——多光源缝隙亮、萤石四周无阴影圈），只有天光需要
 	// 夜晚变暗（月光 0.267→0.083，"夜晚接近黑色"）。按 g 连续无
@@ -336,6 +344,8 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	return vec3(ndl, sh, df);
 	#elif DEBUG_SUNTERM == 2
 	return vec3(0.25 * (SUN_STRENGTH / 100.0) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten);
+	#elif DEBUG_SUNTERM == 3
+	return vec3(sh); // 阴影可见性直显：白=受光(1) 黑=阴影(0)——漏光定位
 	#endif
 	// 月光
 	vec3 md = moonDirV();
@@ -357,7 +367,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// 阴影区域环境光再衰减 50%：ambient 不覆盖 shadow，
 	// 阴影处比普通暗部更暗，投影轮廓清晰
 	vec3 ambC = vec3(0.38, 0.42, 0.68) * (AMBIENT_LIGHT_STRENGTH + 0.08 * n.y);
-	color += albedo * ambC * skyVis * (1.0 - 0.5 * shadowAmt) * (1.0 - df);
+	color += albedo * ambC * skyVis * (1.0 - 0.65 * shadowAmt) * (1.0 - df);
 	// 太阳高光（Blinn-Phong）
 	// shiny 上限 150、强度 1.1：水面高光更宽更柔——过窄的高光在波浪流动时
 	// 亮点满水面乱跳（"光斑随视角变化"的观感），且 1.5 强度会把反射点过曝成白斑
@@ -380,7 +390,7 @@ vec3 calcLight(vec3 albedo, vec3 n, vec2 lmUV, vec3 viewDir, vec3 worldPos, floa
 	// ===== 临时 DEBUG_LIGHT：光照链路分解（验证后删） =====
 	#if DEBUG_LIGHT > 0
 		vec3 ambLightDbg = vec3(lm.g) * skyCorr * mix(1.0, skyNight, 1.0 - df)
-		                 + ambC * skyVis * (1.0 - 0.5 * shadowAmt) * (1.0 - df);
+		                 + ambC * skyVis * (1.0 - 0.65 * shadowAmt) * (1.0 - df);
 		vec3 directDbg = blockAmt * (0.85 + 0.15 * vec3(1.0, 0.5, 0.25)) * dirF
 		               + vec3(1.0, 0.9, 0.75) * (0.25 * (SUN_STRENGTH / 100.0)) * ndl * sh * df * (0.35 + 0.65 * skyLm) * rainAtten
 		               + vec3(0.45, 0.5, 0.75) * (0.06 * (MOON_STRENGTH / 100.0)) * ndm * sh * (1.0 - df) * moonK * rainAtten;
