@@ -88,6 +88,11 @@ value.shadowDistance.192=192
 option.WAVE_AMOUNT=波浪强度
 option.WAVE_AMOUNT.comment=水面波浪起伏强度
 
+option.WATER_WAVE_STYLE=水面波纹风格
+option.WATER_WAVE_STYLE.comment=波纹算法风格：SEUS 风格 = 6 层宽波 + 波峰亮脊；Derivative 风格 = 4 层小碎波 + 距离衰减
+value.WATER_WAVE_STYLE.0=Derivative 小碎波
+value.WATER_WAVE_STYLE.1=SEUS 宽波亮脊
+
 option.UNDERWATER_FOG=水下雾
 option.UNDERWATER_FOG.comment=水下视角的深度雾效果，增加水中氛围
 

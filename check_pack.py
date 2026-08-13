@@ -130,15 +130,18 @@ for fn in fsh_files:
     if bal != 0:
         err("%s 括号不平衡 (%+d)" % (fn, bal))
 
-# ---------- 7. lib 文件不得含 #version 或选项宏 ----------
+# ---------- 7. lib 文件不得含 #version；lib 内 #if 引用选项合法（include
+# 时宏已由顶层 .fsh 定义，如 water.glsl 的 WATER_WAVE_STYLE 分支），
+# 仅禁止无条件 #define（#ifndef 保护的回退定义允许——common.fsh 的
+# SUN_STRENGTH/MOON_STRENGTH 回退模式） ----------
 for fn in os.listdir(os.path.join(ROOT, "lib")):
     content = io.open(os.path.join(ROOT, "lib", fn), encoding="utf-8").read()
     if re.search(r'^\s*#\s*version\b', content, re.M):
         err("lib/%s 不应包含 #version（会被 include 进主文件）" % fn)
     for name in defs:
-        if re.search(r'#\s*(ifdef|ifndef|if)\s+%s\b' % name, content) or \
-           re.search(r'^\s*#\s*define\s+%s\b' % name, content, re.M):
-            err("lib/%s 使用了选项宏 %s（选项只允许在顶层 .fsh 中）" % (fn, name))
+        if re.search(r'^\s*#\s*define\s+%s\b' % name, content, re.M) and \
+           not re.search(r'#\s*ifndef\s+%s\b' % name, content):
+            err("lib/%s 无条件定义了选项 %s（lib 不得 #define 选项；回退定义必须用 #ifndef 保护，值由顶层 .fsh 提供）" % (fn, name))
 
 # ---------- 8. 缓冲格式常量格式 ----------
 for fn in fsh_files:

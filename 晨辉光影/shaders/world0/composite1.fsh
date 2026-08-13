@@ -19,6 +19,7 @@ in vec2 texcoord;
 #define RAIN_WET 1 // 雨天湿润效果 [0 1]
 #define SHADOW_QUALITY 1 // 阴影质量 [0 1 2]
 #define WAVE_AMOUNT 50 // 波浪强度 [[0 25 30 50 75 100]]
+#define WATER_WAVE_STYLE 1 // 水面波纹风格 [0 1] (0=Derivative 4层noise2 小碎波 1=SEUS 6层noisetex 宽波亮脊)
 #define UNDERWATER_FOG 1 // 水下雾 [0 1]
 #define BRIGHTNESS 100 // 亮度 [50 60 70 80 90 100 110 120 130 140 150]
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
@@ -716,19 +717,53 @@ void main() {
 					vec3 sunSpec = vec3(1.0, 0.8, 0.55)
 						* pow(max(dot(Rn, sunDirV()), 0.0), 350.0) * (0.15 + 0.85 * dfFog);
 					color += sunSpec * mix(0.5, 1.0, reflK);
-					// ===== 水底光折射（caustics，Derivative 思路的屏幕空间版） =====
-					// 光经波浪表面折射在水底聚焦成亮斑：波法线 xy 梯度做
-					// 折射位移驱动噪声图案（随波浪流动），水深越浅斑越锐利
-					// （深水光散开衰减）。Derivative 在阴影 pass 用折射面积
-					// 变化算真 caustics（shadowcolor 管线，前向管线不可移植）
-					// ——本实现直接加亮水面像素（含 35% 透出的水底），观感等价
+					// 浅水区光斑（2026-08-14 移植 SEUS CalculateWaterCaustics）：
+					// 水面像素（透出浅水底部分）加亮——SEUS 同款物理聚焦
+					//（水面像素 vertical≈0 → 基准亮斑 ~1.65，浅水/深水水面
+					// 都有波光，SEUS 语义）。×0.35 缩放 + clamp 适配 LDR，
+					// dfFog 门控只白天
+					if (dfFog > 0.05) {
+						// 光斑追算点用 colortex3 不透明深度 = 水底位置
+						//（水面像素自身 vertical≈0 无聚焦信息，且旧版
+						// 逐像素 dither 命中才亮 = 屏幕噪点源）
+						float botD = texture(colortex3, texcoord).r;
+						if (botD > 0.001 && botD < 0.9995) {
+							vec3 botWp = worldPosFromView(viewPosFromDepth(botD, texcoord));
+							// 朝向门控（2026-08-14 用户要求：仅朝天空的
+							// 一面有光斑）：屏幕空间法线从 colortex3 水底
+							// 深度差分重建（水面像素的 depthtex0 = 水面
+							// 自身，不能用）。邻居深度无效（天空/无内容）
+							// 时退化为同深度 → 叉积零 → 无光斑
+							vec2 pxN = vec2(2.0 / viewWidth, 2.0 / viewHeight);
+							float nxD = texture(colortex3, texcoord + vec2(pxN.x, 0.0)).r;
+							float nyD = texture(colortex3, texcoord + vec2(0.0, pxN.y)).r;
+							nxD = (nxD > 0.001 && nxD < 0.9995) ? nxD : botD;
+							nyD = (nyD > 0.001 && nyD < 0.9995) ? nyD : botD;
+							vec3 pX = worldPosFromView(viewPosFromDepth(nxD, texcoord + vec2(pxN.x, 0.0)));
+							vec3 pY = worldPosFromView(viewPosFromDepth(nyD, texcoord + vec2(0.0, pxN.y)));
+							vec3 faceN = cross(pX - botWp, pY - botWp);
+							float upF = (dot(faceN, faceN) > 1e-14) ? smoothstep(0.15, 0.5, normalize(faceN).y) : 0.0;
+							if (upF > 0.001) {
+								// 水深门控（2026-08-14 用户要求：仅浅水
+								// 区可见）：水深 <2 格全显、2~3 格渐隐、
+								// >3 格无光斑（深水光斑在水底被水吸收，
+								// 水面上不可见）
+								float wDepth = max(63.0 - botWp.y, 0.0);
+								float depthK = 1.0 - smoothstep(2.0, 3.0, wDepth);
+								if (depthK > 0.001) {
+									float cauS = waterCausticsSEUS(botWp, ampW);
+									color += color * vec3(1.0, 0.95, 0.85) * clamp(cauS * 0.5, 0.0, 1.2) * dfFog * upF * depthK;
+								}
+							}
+						}
+					}
 			}
 			}
 		}
 	}
 	// ===== 水下视角水底光斑（isEyeInWater=1） =====
 	// 眼睛在水下时水面程序不渲染（无水面像素），光斑直接加在
-	// 水下地形/水底像素上：波法线图案仅依赖 xz（waterNormalWorld
+	// 水下地形/水底像素上：光斑由 SEUS 折射追算驱动（waterNormalWorld
 	// 忽略 y），同一列的水面波浪直接用于水下光斑；距离衰减按
 	// 像素距离（深水光散开）
 	if (isEyeInWater > 0.5 && d < 0.9995 && texture(colortex3, texcoord).r < 0.9995) {
@@ -751,30 +786,18 @@ void main() {
 		float upF = (dot(faceN, faceN) > 1e-14) ? smoothstep(0.15, 0.5, normalize(faceN).y) : 0.0;
 		if (upF > 0.001) {
 			vec3 uWp = pC;
-			float uampW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
-			// 光斑 = 波法线曲率（与波纹严格对齐），折射位移基值同水面版
-			// 高斯曲率版（旋转不变 = 网状，同水面版）
-			vec2 ucp0 = vec2(uWp.x, uWp.z * 0.8);
-			float uwaveT2 = frameTimeCounter * 0.6;
-			float uE2 = 1.0;
-			float uhh0 = waterHeightField(ucp0, uwaveT2);
-			float uhhXp = waterHeightField(ucp0 + vec2(uE2, 0.0), uwaveT2);
-			float uhhXm = waterHeightField(ucp0 - vec2(uE2, 0.0), uwaveT2);
-			float uhhZp = waterHeightField(ucp0 + vec2(0.0, uE2), uwaveT2);
-			float uhhZm = waterHeightField(ucp0 - vec2(0.0, uE2), uwaveT2);
-			float uhhPP = waterHeightField(ucp0 + vec2(uE2, uE2), uwaveT2);
-			float uhhPM = waterHeightField(ucp0 + vec2(uE2, -uE2), uwaveT2);
-			float uhhMP = waterHeightField(ucp0 + vec2(-uE2, uE2), uwaveT2);
-			float uhhMM = waterHeightField(ucp0 - vec2(uE2, uE2), uwaveT2);
-			float uhhxx = (uhhXp - 2.0 * uhh0 + uhhXm) / (uE2 * uE2);
-			float uhhzz = (uhhZp - 2.0 * uhh0 + uhhZm) / (uE2 * uE2);
-			float uhhxz = (uhhPP - uhhPM - uhhMP + uhhMM) / (4.0 * uE2 * uE2);
-			float ucau = clamp(pow(sqrt(abs(uhhxx * uhhzz - uhhxz * uhhxz)) * uampW * 12.0, 1.8), 0.0, 2.0);
+			float uAmpW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
+			// 2026-08-14 移植 SEUS CalculateWaterCaustics：光从水面
+			//（y=63 海平面近似）经波浪法线折射，追算聚焦碰撞点与当前
+			// 像素距离 → 聚焦亮斑（物理 caustics，替代旧版高斯曲率近似）。
+			// 返回值 0~3 HDR 量级，×0.5 缩放适配 LDR 加法合成
+			//（旧曲率版量级 0.03~2.0）
+			float uCau = waterCausticsSEUS(uWp, uAmpW);
 			float uAtten = exp(-length(viewPosFromDepth(d, texcoord)) * 0.12);
 			cauAddCol = color * vec3(1.0, 0.95, 0.85);
-			cauAddAmt = (0.03 + ucau * 1.0) * uAtten * dfFog * (1.0 - wetness * 0.7);
+			cauAddAmt = clamp(uCau * 0.5, 0.0, 1.2) * uAtten * dfFog * (1.0 - wetness * 0.7);
 			cauAddAmt *= upF; // 朝向渐变：缓坡光斑渐弱
-			cauAddAmt *= uShUnder; // 阴影处排除光斑（同水面版 shadowSample 门控）
+			cauAddAmt *= uShUnder; // 阴影处排除光斑（shadowSample 门控）
 			color += cauAddCol * cauAddAmt;
 		}
 	}

@@ -29,6 +29,7 @@ in vec3 normalV;
 #define RAIN_WET 1 // 雨天湿润效果 [0 1]
 #define SHADOW_QUALITY 1 // 阴影质量 [0 1 2]
 #define WAVE_AMOUNT 50 // 波浪强度 [[0 25 30 50 75 100]]
+#define WATER_WAVE_STYLE 1 // 水面波纹风格 [0 1] (0=Derivative 4层noise2 小碎波 1=SEUS 6层noisetex 宽波亮脊)
 #define UNDERWATER_FOG 1 // 水下雾 [0 1]
 #define BRIGHTNESS 100 // 亮度 [50 60 70 80 90 100 110 120 130 140 150]
 #define SATURATION 100 // 饱和度 [50 60 70 80 90 100 110 120 130 140 150]
