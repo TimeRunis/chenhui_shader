@@ -89,9 +89,13 @@ vec3 cloudShade(float avgLit, float df, float wet) {
 //    + 底部削薄（-0.5×normalizedHeight），密度主体偏上层
 // wind：世界空间风位移（照搬 Derivative vec3(2e-3,2e-4,1e-3)）
 float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
-	// 云带分布（localCoverage）：fbm2 2 oct 替代 noisetex
+	// 云带分布（localCoverage）：fbm2 2 oct 替代 noisetex。
+	// 2026-08-13"头顶没云"修复：Derivative 式下限 0.5 + 削减使低带区
+	// 密度削到 <0——玩家站在云带空区时头顶（垂直穿过云层）长期无云
+	//（wind 25 格/秒 vs 云带特征 5000 格 = 200 秒/周期，移动极慢）。
+	// 下限 0.6：任何位置至少有 60% 云带强度（头顶总有云，空区变薄云）
 	float localCoverage = fbm2(p.xz * 2e-4 - wind.xz * 2e-3, 2);
-	localCoverage = clamp(localCoverage * 3.0 + rainStrength - 0.4, 0.0, 1.0) * 0.5 + 0.5;
+	localCoverage = max(clamp(localCoverage * 3.0 + rainStrength - 0.4, 0.0, 1.0) * 0.5 + 0.5, 0.6);
 	if (localCoverage < 0.1) return 0.0;
 	// 3D 密度场（5 oct ×3 递进；z 直接偏移不放大——Derivative 的
 	// 3D 噪声垂直频率与水平一致（特征 2500/3ⁱ 格）。旧 fbm3 风格
@@ -111,17 +115,14 @@ float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
 	density += 0.5 / 3.0 / 5.0;
 	if (density < 1e-6) return 0.0;
 	density *= localCoverage;
-	// 垂直高度曲线（Derivative 公式，削减校准到我们的噪声值域）：
-	// Derivative 默认 0.9/0.5/0.1 在我们噪声分布下把均值密度减成
-	// ≈0——只有 fbm 峰值成云，峰值在采样点间随机出现 → 云沿视线
-	// 方向被切成"一片一片"（十几片云叠成一团）。削减取 0.6/0.3/
-	// 0.05：层中部密度连续成团（相邻采样点低频主导、平滑过渡），
-	// 边缘仍自然稀疏淡出
+	// 垂直高度曲线（2026-08-13 削减放宽 0.6/0.3/0.05 → 0.5/0.25/0.05：
+	// 头顶/低带区密度不再被削到 <0——配合 localCoverage 下限 0.6，
+	// 任何位置头顶都有可见云层）
 	float normalizedHeight = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
 	float heightAttenuation = clamp(normalizedHeight * 6.6, 0.0, 1.0)
 	                         * clamp((1.0 - normalizedHeight) * (2.0 + rainStrength), 0.0, 1.0);
 	density *= heightAttenuation * 1.9;
-	density -= heightAttenuation * 0.6 + normalizedHeight * 0.3 + 0.05;
+	density -= heightAttenuation * 0.5 + normalizedHeight * 0.25 + 0.05;
 	// 最终倍率 = Derivative 默认 ×3.0（× cloudDensity 选项，
 	// CLOUD_DENSITY=150 → 实际 ×4.5）
 	return clamp(density * 3.0 * cloudDensity, 0.0, 1.0);

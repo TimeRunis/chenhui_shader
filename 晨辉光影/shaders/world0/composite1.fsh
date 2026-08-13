@@ -321,17 +321,40 @@ void main() {
 		vec3 uTransW = exp(-vec3(0.52, 0.18, 0.11) * dist);
 		color = color * uTransW + wfCol * (1.0 - uTransW);
 	}
-	// ===== 水下太阳阴影对比增强（用户要求加强） =====
+	// ===== 水底太阳/月光直射阴影 + 直射穿透（2026-08-13 用户要求恢复） =====
 	// 水下地形（非水面/非天空）像素重算 sh 判定（shadowtex1，与
-	// gbuffer 阶段同一阴影源）：阴影区（sh<1）压暗、受光区不变——
-	// 水下方块/柱子的太阳投影对比加深。放在雾之后（对比最强）、
-	// 水下光斑之前（光斑聚焦亮区不受压暗影响）
+	// gbuffer 阶段同一阴影源，Iris 夜晚自动切月亮相机）：岸上物
+	//（树/墙/岸沿）投影到水底——直射被挡处亮度下降（Derivative 模型：
+	// 阴影 = 直射消失），受光区保留。白天太阳直射占比 ≈0.25×ndl×df、
+	// 夜晚月光 ≈0.06×月光——阴影区 ×(1-directRatio)。放在雾之后
+	//（对比最强）、水下光斑之前
 	if (isEyeInWater > 0.5 && d < 0.9995 && texture(colortex1, texcoord).b < 0.5) {
 		vec3 wpS = worldPosFromView(viewPosFromDepth(d, texcoord));
 		uShUnder = shadowSample(wpS, vec3(0.0, 1.0, 0.0), 1);
-		// 水底亮度调高（用户要求"水底清晰"）：受光区 0.8 → 0.95
-		//（接近原亮度）、阴影区 0.56 → 0.7（对比保持 1.36）
-		color *= mix(0.7, 0.95, uShUnder);
+		float dfU = dayFactorF();
+		float sunRatioU = 0.25 * (SUN_STRENGTH / 100.0) * dfU;                  // 太阳直射相对占比
+		float moonRatioU = 0.06 * (MOON_STRENGTH / 1000.0) * (1.0 - dfU) * 0.335; // 月光直射相对占比
+		float directRatioU = clamp((sunRatioU + moonRatioU) * 1.6, 0.0, 0.45);
+		color *= 1.0 - directRatioU * (1.0 - uShUnder);
+		// 水底直射穿透（用户要求"水底被太阳照亮"）：水下雾（RGB 吸收，
+		// 红通道 5 格水仅剩 ~18%）把 gbuffers 的直射冲淡 → 雾后颜色 =
+		// 天光雾色主导，受光区没有太阳直射的暖亮感。按水深透射
+		//（uTransW，与雾同吸收系数）补回直射分量：浅水全透 → 直射
+		// 明显、深水随吸收衰减；uShUnder 门控 → 阴影区不补。skyLm
+		// 近似 1.0（开阔水底天光高，复合阶段无逐像素光照图坐标）。
+		// ×0.5 防与 gbuffers 已算直射重复叠加
+		vec3 albedoU = texture(colortex2, texcoord).rgb;
+		vec3 uTransW = exp(-vec3(0.52, 0.18, 0.11) * dist); // 与雾块同系数（作用域不可达重算）
+		float ndlU = clamp(dot(vec3(0.0, 1.0, 0.0), sunDirV()), 0.0, 1.0);
+		float rainAttenU = 1.0 - 0.9 * wetness;
+		vec3 sunDirectU = albedoU * vec3(1.0, 0.9, 0.75)
+		                * (0.25 * (SUN_STRENGTH / 100.0)) * ndlU * dfU * uShUnder
+		                * rainAttenU;
+		float ndmU = clamp(dot(vec3(0.0, 1.0, 0.0), moonDirV()), 0.0, 1.0);
+		vec3 moonDirectU = albedoU * vec3(0.45, 0.5, 0.75)
+		                 * (0.06 * (MOON_STRENGTH / 1000.0)) * ndmU * (1.0 - dfU) * uShUnder
+		                 * 0.5 * rainAttenU;
+		color += (sunDirectU + moonDirectU) * uTransW * 0.5;
 	}
 	// ===== 逆预曝光 + HDR 软压缩（修复光斑压平与高光溢出） =====
 	// gbuffers 写入前已乘 PRE_EXPOSURE 0.62（把 HDR 压进 RGBA8 量化范围），
