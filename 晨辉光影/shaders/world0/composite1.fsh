@@ -3,8 +3,8 @@
 in vec2 texcoord;
 
 // ===== 晨辉光影 选项（各文件定义必须完全一致） =====
-#define CLOUDS 2 // 体积云 [0 1 2 3]
-#define CLOUD_DENSITY 150 // 云密度 [50 75 100 125 150 175 200]
+#define CLOUDS 1 // 体积云 [0 1 2]
+#define CLOUD_DENSITY 75 // 云密度 [50 75 100 125 150 175 200]
 #define CLOUD_SHADOW 40 // 云影强度 [0 20 40 60 80 100]
 #define WATER_REFLECT 1 // 水面反射 [0 1 2]
 #define LIGHT_GLOW 100 // 手持光源强度 [0 20 40 60 80 100]
@@ -93,32 +93,62 @@ void main() {
 	// 采样/不采样跳变（"黑色影子"）。skyUnder 像素（背后=天空）走
 	// 程序化天空（方向扰动，见下方分支）。
 	// 作用范围：水面像素（水面上看水面）+ 水下看水面以上内容
-	//（uThroughWater：方块/岸/树透过水面显示——视线朝上且背后非
-	// 天空）。此前只扰动水面像素 → 方块内部（透出部分）晃而轮廓
-	//（方块本体像素）不晃 = "材质在方块里面晃动"
+	//（uThroughWater：方块/岸/树透过水面显示——世界视线方向朝上，
+	// 而不是屏幕坐标 y>0：抬头时屏幕下半同样朝上看景物，旧判定漏掉）
 	vec3 uVpNow = viewPosFromDepth(d, texcoord);
-	bool uThroughWater = (isEyeInWater > 0.5 && normalize(uVpNow).y > 0.0);
+	vec3 uUpV = normalize(gbufferModelView[1].xyz); // 视空间上方向
+	vec3 uViewV = normalize(uVpNow);                // 视空间视线方向
+	bool uThroughWater = (isEyeInWater > 0.5 && dot(uViewV, uUpV) > 0.0);
 	if ((texture(colortex1, texcoord).b > 0.5 || uThroughWater)
 	 && texture(colortex3, texcoord).r < 0.9995) {
 		vec3 uWpW = worldPosFromView(uVpNow);
 		float uAmpW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
 		vec3 uWnW = waterNormalWorld(uWpW, uAmpW);
 		vec3 uNvW = normalize(mat3(gbufferModelView) * uWnW);
-		vec3 uUpV = normalize(gbufferModelView[1].xyz); // 视空间上方向
 		// 统一固定系数偏移（Derivative 深度比例在方块深/水底浅处
 		// uRefrD 跳变 → 方块与背景偏移不连续 → 边缘撕裂"轮廓不动/
 		// 融化"）：偏移只由波浪法线决定（波浪连续 → 偏移连续），整个
 		// 透过水面的画面随波浪一致平移——方块轮廓随波浪移动
 		vec2 uRefr = (uUpV.xy - uNvW.xy) * 0.8;
+		// 距离衰减：屏幕空间折射位移应 ∝ 1/相机到水面距离。旧固定
+		// 系数在远处水面同样按 0.8 平移 UV，而远处每个像素覆盖更大
+		// 的世界范围（跨过更多波纹/水底内容）= 视觉扭曲被放大——
+		// 观察者离水面越远，水面扭曲越严重（用户反馈根因）。
+		// 8 格基准线性衰减：8 格内保持原强度（水边正常）、16/32 格
+		// 减弱到 50%/25%、远处水面渐静。不恢复 Derivative 的深度差
+		// 比例（水底/方块深度跳变会造成边缘撕裂），只用连续距离项
+		float uDistW = length(uVpNow);
+		uRefr *= clamp(8.0 / max(uDistW, 0.5), 0.0, 1.0);
+		// 水面上往水下看：整体强度再降 1/3（0.8 → 0.533，用户要求）
+		// 仅作用于水上看水底分支；水下透水面（uThroughWater）保持
+		// 上一版调好的整体平移强度
+		if (!uThroughWater) uRefr *= 2.0 / 3.0;
 		vec2 uUVr = texcoord + uRefr;
-		// Derivative 深度检查原式：折射采样点比当前更近（前景遮挡）
-		// 才退回（uVd=0）——同深度/更远 → 采样（uVd=1）。图像整体
-		// 平移：方块（含轮廓）随波浪一致偏移。注意 smoothstep 无 1−
-		// 前缀：colortex3=d（同深度）→ smoothstep=1 → 采样；colortex3
-		// < d−0.04（更近前景）→ 0 → 退回（之前加 1− 前缀方向反了，
-		// 方块同深度被退回 = "方块不晃"）
-		float uVd = smoothstep(d - 0.04, d - 0.001, texture(colortex3, uUVr).r);
-		color = mix(color, texture(gcolor, uUVr).rgb, uVd);
+		float uDepthR = texture(colortex3, uUVr).r;
+		if (uThroughWater) {
+			// 水下透水面看景物：整体画面平移（不再用深度门禁 mix——
+			// mix 只让材质颜色移动、轮廓固定，边缘还采到未绘制的
+			// gcolor 天空 = 黑色区域）。这里无条件取偏移点颜色：
+			// 材质与轮廓一起随波浪移动（理想效果）；偏移点落在天空
+			// 时，gcolor 的天空还是黑的，按折射后的视线方向程序化
+			// 绘制天空——景物边缘随波浪弯曲后露出的背景是天空，
+			// 不再是轮廓内黑区
+			vec3 uColR = texture(gcolor, uUVr).rgb;
+			if (uDepthR > 0.9995) {
+				vec3 uRdR = normalize(uViewV + (uUpV - uNvW) * 0.5);
+				vec3 uWdR = normalize(mat3(gbufferModelViewInverse) * uRdR);
+				uColR = getSkyColor(uWdR, STARS / 100.0, SUN_GLOW / 100.0,
+				                    SUN_SIZE / 100.0, MOON_SIZE / 100.0,
+				                    STAR_DENSITY / 100.0, float(CLOUDS),
+				                    float(CLOUD_DENSITY) / 100.0) * PRE_EXPOSURE;
+			}
+			color = uColR;
+		} else {
+			// 水面像素（水上看水底）：保持原单端规则——水底深度本就
+			// 比水面远（Δd>0），"更远就采样"是水底折射正常工作的前提
+			float uVd = smoothstep(d - 0.04, d - 0.001, uDepthR);
+			color = mix(color, texture(gcolor, uUVr).rgb, uVd);
+		}
 	}
 	// SSR 调试变量（DEBUG_SSR 可视化用，默认不产生任何开销）
 	float dbgSsrWater = 0.0;  // waterMask：水面识别（alpha+深度+邻居一致性）

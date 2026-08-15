@@ -1,9 +1,8 @@
 option.CLOUDS=体积云
-option.CLOUDS.comment=程序化体积云质量，越高云朵细节越丰富，性能消耗越大
+option.CLOUDS.comment=云渲染模式：2D 为经典层状云（速度快），3D 为真三维体积云团（质量高）
 value.CLOUDS.0=关闭
-value.CLOUDS.1=低
-value.CLOUDS.2=中
-value.CLOUDS.3=高
+value.CLOUDS.1=2D 云
+value.CLOUDS.2=3D 云
 
 option.CLOUD_DENSITY=云密度
 option.CLOUD_DENSITY.comment=云层不透明度，越高云越浓厚，越低云越轻薄

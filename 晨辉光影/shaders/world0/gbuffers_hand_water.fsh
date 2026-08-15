@@ -15,8 +15,8 @@ in vec3 viewPos;
 in vec3 normalV;
 
 // ===== 晨辉光影 选项（各文件定义必须完全一致） =====
-#define CLOUDS 2 // 体积云 [0 1 2 3]
-#define CLOUD_DENSITY 150 // 云密度 [50 75 100 125 150 175 200]
+#define CLOUDS 1 // 体积云 [0 1 2]
+#define CLOUD_DENSITY 75 // 云密度 [50 75 100 125 150 175 200]
 #define CLOUD_SHADOW 40 // 云影强度 [0 20 40 60 80 100]
 #define WATER_REFLECT 1 // 水面反射 [0 1 2]
 #define LIGHT_GLOW 100 // 手持光源强度 [0 20 40 60 80 100]

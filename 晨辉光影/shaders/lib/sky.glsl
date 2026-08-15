@@ -4,6 +4,9 @@
 // 云层高度/厚度对齐 Derivative Main（altitude 1000、thickness 1400）
 float CLOUD_BASE = 1000.0;  // 云层底（高空云）
 float CLOUD_TOP = 2400.0;   // 云层顶（厚 1400 格）
+// 单位密度每格吸收系数（volCloud 路径积分用）：d=1、步长 58 格时
+// 单步透过率 ≈ exp(-0.23)，24 步密云近实心、边缘薄透——体积厚度感
+float CLOUD_ABSORB = 0.004;
 
 // ===== 维度检测（无 dimension uniform，用固定雾色判定） =====
 // 末地雾色 ≈ (0.082, 0.0625, 0.0664) 暗紫；下界雾色 ≈ (0.302, 0.09, 0.09) 暗红
@@ -42,17 +45,8 @@ vec3 starField(vec3 dir, float strength, float density01, float moonDiscR) {
 	return vec3(0.85, 0.9, 1.0) * s * tw * strength * mask;
 }
 
-// ===== 云（2D 高度场 + 垂直形状） =====
-float cloudDensity(vec2 xz, float y) {
-	vec2 uv = xz * 0.0011 + vec2(frameTimeCounter * 0.006, 0.0);
-	float cov = fbm2(uv, 3);
-	cov = smoothstep(0.45, 0.62, cov);
-	float shape = smoothstep(0.0, 0.35, (y - CLOUD_BASE) / 17.0)
-	            * (1.0 - smoothstep(0.65, 1.0, (y - CLOUD_BASE) / 17.0));
-	float detail = 0.55 + 0.45 * fbm2(uv * 2.7 + vec2(0.0, y * 0.05), 2);
-	return cov * shape * detail;
-}
-
+// （旧 cloudDensity() 2D 高度场死代码已删除——实际生效的只有
+//  cloudVolumeDensity / cloudVolumeDensityHQ 体积密度模型）
 // 云光照：把 volCloud 累积的平均散射光照（0~1，含前向散射与自阴影）
 // 映射为颜色。旧版签名里的 dens 参数从未被使用（函数体只读太阳高度）
 // → 整片云统一亮白，无明暗变化；现在颜色随 avgLit 渐变。
@@ -84,32 +78,23 @@ vec3 cloudShade(float avgLit, float df, float wet) {
 	return col;
 }
 
-// ===== 体积云密度模型（移植 Derivative Main lib/Atmosphere/
-// VolumetricClouds.glsl CloudVolumeDensity + localCoverage） =====
-// 密度形态与 Derivative 一致：
-// ① 大尺度覆盖场（~5000 格周期）：云带分布（localCoverage 移植）
-// ② 5 oct 3D 噪声密度场（基频 4e-4 = 2500 格周期，×3 递进到 31 格）
-// ③ 垂直高度曲线：层内快速进入（×6.6）+ 顶部淡出（×(2+wet)）
-//    + 底部削薄（-0.5×normalizedHeight），密度主体偏上层
-// wind：世界空间风位移（照搬 Derivative vec3(2e-3,2e-4,1e-3)）
+// ===== 体积云密度模型（2D 云档专用：恢复最开始的效果） =====
+// 即 2026-08 重写前的最初实现：
+// ① 大尺度覆盖场 fbm2 2 oct（基频 2e-4，~5000 格周期）
+// ② 5 oct noise2(position.xy + position.z) 伪 3D（垂直频率与
+//    水平一致，垂直方向无独立起伏 = 2D 层状观感）
+// ③ 原垂直高度曲线：×6.6 快速进入 + 顶部淡出 + 线性削减，
+//    密度主体呈水平板（用户认可的最初 2D 风格）
+// ④ 细噪点来自 93/31 格两层高频 oct 在 117~400 格步长下混叠
+//    ——该观感按用户要求保留为 2D 档风格
 float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
-	// 云带分布（localCoverage）：fbm2 2 oct 替代 noisetex。
-	// 2026-08-13"头顶没云"修复：Derivative 式下限 0.5 + 削减使低带区
-	// 密度削到 <0——玩家站在云带空区时头顶（垂直穿过云层）长期无云
-	//（wind 25 格/秒 vs 云带特征 5000 格 = 200 秒/周期，移动极慢）。
-	// 下限 0.6：任何位置至少有 60% 云带强度（头顶总有云，空区变薄云）
+	// 云带分布（localCoverage）：fbm2 2 oct 替代 noisetex；
+	// 下限 0.6：任何位置至少有 60% 云带强度
 	float localCoverage = fbm2(p.xz * 2e-4 - wind.xz * 2e-3, 2);
 	localCoverage = max(clamp(localCoverage * 3.0 + rainStrength - 0.4, 0.0, 1.0) * 0.5 + 0.5, 0.6);
 	if (localCoverage < 0.1) return 0.0;
-	// 3D 密度场（5 oct ×3 递进；z 直接偏移不放大——Derivative 的
-	// 3D 噪声垂直频率与水平一致（特征 2500/3ⁱ 格）。旧 fbm3 风格
-	// ×17.31 折叠把垂直频率放大 17.31 倍 → 云层内垂直方向全高频，
-	// 采样步长（72~2500 格）垂直分量严重欠采样 → 云沿视线方向被
-	// 拉成长条、全部指向日月方向（亮区最显眼）的根因）
 	vec3 position = p * 4e-4 - wind;
 	float density = 0.03;
-	// 各 oct 权重 = Derivative 默认（octWeight 0.5 递进）：
-	// 0.5/0.25/0.125/0.0625/0.03125
 	float weight = 0.5;
 	for (int i = 0; i < 5; i++) {
 		density += weight * noise2(position.xy + position.z);
@@ -119,37 +104,60 @@ float cloudVolumeDensity(vec3 p, float cloudDensity, vec3 wind) {
 	density += 0.5 / 3.0 / 5.0;
 	if (density < 1e-6) return 0.0;
 	density *= localCoverage;
-	// 垂直高度曲线（2026-08-13 削减放宽 0.6/0.3/0.05 → 0.5/0.25/0.05：
-	// 头顶/低带区密度不再被削到 <0——配合 localCoverage 下限 0.6，
-	// 任何位置头顶都有可见云层）
 	float normalizedHeight = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
 	float heightAttenuation = clamp(normalizedHeight * 6.6, 0.0, 1.0)
 	                         * clamp((1.0 - normalizedHeight) * (2.0 + rainStrength), 0.0, 1.0);
 	density *= heightAttenuation * 1.9;
 	density -= heightAttenuation * 0.5 + normalizedHeight * 0.25 + 0.05;
-	// 最终倍率 = Derivative 默认 ×3.0（× cloudDensity 选项，
-	// CLOUD_DENSITY=150 → 实际 ×4.5）
 	return clamp(density * 3.0 * cloudDensity, 0.0, 1.0);
 }
 
-// ===== 稳定高度云层（ray-cloud intersection，仅主世界） =====
+// ===== 体积云密度模型（3D 云档：CLOUDS=2，方案 A） =====
+// 与 2D 档（旧模型）的区别：真 3D 值噪声 fbm3d（三轴频率独立）+ 4 oct 细节，
+// 垂直基频 1e-3（1000 格）→ 层厚 1400 格内有完整起伏周期，云团
+// 在高度方向圆润堆积，边缘为 smoothstep 重映射出的团块轮廓。
+// dt：采样步长，fbm3d 内部按特征周期对每 octave 连续 fade——
+// 无整数 LOD 切换边界（太阳周围同心圆伪影的根因）
+float cloudVolumeDensityHQ(vec3 p, float cloudDensity, vec3 wind, float dt) {
+	vec3 q = p - wind;
+	// 大尺度覆盖场：3 oct，基频 1e-4（~10000 格，原 2e-4）——
+	// 大片云团数量减半、单个云团更大（用户"大片云数量减半"）
+	float covN = fbm2(q.xz * 1e-4, 3);
+	float coverage = max(smoothstep(0.30, 0.60, covN * 0.9 + rainStrength * 0.4), 0.25);
+	// 真 3D 密度场：水平基频 4e-4（2500 格），垂直基频 1e-3（1000 格）
+	vec3 w = vec3(q.x * 4e-4, q.z * 4e-4, q.y * 1.0e-3);
+	float shape = fbm3d(w, dt);
+	// 阈值重映射：低幅高频归零 → 团状，不产生细颗粒
+	shape = smoothstep(0.35, 0.65, shape);
+	// 积云式垂直曲线：平底 + 圆顶，主体偏下层（经典积云剖面）。
+	// 高档加厚：顶部衰减 0.55→0.65，密度平台向上延到 nh≈0.7，
+	// 垂直方向更厚实
+	float nh = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
+	float heightGradient = smoothstep(0.0, 0.07, nh)
+	                     * (1.0 - smoothstep(0.65, 1.00, nh));
+	// 倍率 1.1 → 2.8：补偿 CLOUD_DENSITY 减半，并让 3D 云比减半前
+	// 更厚（2D 档保持减半后的旧效果不变）
+	return clamp(shape * coverage * heightGradient * 2.8 * cloudDensity, 0.0, 1.0);
+}
+
+// ===== 3D 体积云（ray-cloud intersection + 路径积分，CLOUDS=2） =====
 // 云层是两平行平面（y=CLOUD_BASE ~ y=CLOUD_TOP）之间的世界空间
 // 水平带（高空 1000~2400，对齐 Derivative）。视线与两平面交点的
 // 参数 t 取 min/max 排序，相机在层下（仰视）、层内（穿层）、层上
 // （俯视云海）三种位置统一处理。
-// 采样策略（对齐 Derivative）：步长 = 路径/步数（无固定上限——
-// 密度场是低频的（基频 2500 格），大步长不欠采样；旧版 10 格上限
-// 是为高频 2D 云形设计的，已随密度模型一起移除）。
-// 光照：透明度（dens）与散射光（lit）分开累积——透射强度只由
-// 几何密度决定，亮度另算前向散射（视线朝向太阳的云亮）与自阴影
-// （密云背光侧暗），云团有迎光/背光面。
-// 步长起点按像素 hash 抖动（固定幅度 30 格 ≈ 1% 主噪声周期，打散
-// 大步长下的采样对齐，防条带）。
-// cloudLevel：调用方传入 CLOUDS 选项值（0 关 / 1 低 / 2 中 / 3 高）
-// cloudDensity：调用方传入 CLOUD_DENSITY/100（1.0 = 基准，1.5 = 1.5 倍）
-// ——lib 文件不允许直接用选项宏
-vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDensity) {
-	if (cloudLevel < 0.5) return skyCol;
+// 采样策略（2026-08 重写，3D 档专用）：
+// ① 固定 32 步，步长 = 路径/步数；固定 32 次循环上限 + break
+// ② 频率 LOD 连续淡出：fbm3d 按每 octave 特征周期随 dt 平滑
+//    fade（0.30~0.55×周期）——无整数档切换边界（太阳周围同心圆
+//    伪影的根因），地平线方向也不会出现混叠细噪点
+// ③ 透射沿路径 Beer-Lambert 积分（替代"平均密度→薄纱"）：平视
+//    长路径云变实、仰视短路径云变薄，云有体积厚度而不是层带
+// ④ 光照累积：每步 alpha × 当前透射加权，前向散射 + 自阴影保留
+// ⑤ 垂直分层用密度加权平均高度（替代"最后采样点"高度），并弱化
+//    云底/云顶明暗差——不再沿高度刷出水平条带
+// ⑥ 抖动幅度与步长联动（dt×0.3，原固定 30 格对大步长无效）
+// cloudDensity：调用方传入 CLOUD_DENSITY/100（0.75 = 减半后基准）
+vec3 volCloud3D(vec3 dir, vec3 skyCol, float df, float cloudDensity) {
 	// 纯平视（|dir.y| < 0.001）：交点趋近无穷，云带退化为地平线
 	// 细线，省略采样（也避免除零）
 	if (abs(dir.y) < 0.001) return skyCol;
@@ -164,38 +172,94 @@ vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDens
 	// 高空云层地平线方向路径更长，上限不足会让地平线云带消失
 	float maxT = min(tFar, 20000.0);
 	if (tNear >= maxT) return skyCol;
-	// 步数提高（低档 8 步 → 12）：地平线方向路径 20000 格时旧步长
-	// 2500 格/步严重欠采样 = 云拉成水平层带（"一层一层"的根因）
-	int maxSteps = (cloudLevel > 2.5) ? 24 : ((cloudLevel > 1.5) ? 16 : 12);
-	// 步长 = 路径/步数，上限 400 格（16% 主噪声周期 2500 格）：
-	// 防地平线方向极端大步长；地平线覆盖到 9.6km（透视压缩区内）
-	float dt = min((maxT - tNear) / float(maxSteps), 400.0);
+	float dt = (maxT - tNear) / 32.0;
+	// 频率 LOD 不取整数档：dt 直接传入 fbm3d，各 octave 按自身
+	// 特征周期连续淡出，避免整数切换边界在屏幕上形成同心圆
 	float t = tNear;
-	float dens = 0.0;   // 透明度累积（几何密度）
-	float lit = 0.0;    // 散射光累积（密度 × 前向散射 × 自阴影）
-	float ty = 0.0;     // 垂直归一化高度（循环内更新，末尾垂直分层用）
+	float trans = 1.0;  // 沿路径透射（1 = 全透明）
+	float lit = 0.0;    // 散射光累积（alpha × 透射加权）
+	float litW = 0.0;
+	float ty = 0.0;     // 密度加权平均高度（垂直明暗分层用）
+	float tyW = 0.0;
 	int cnt = 0;
 	vec3 sd = sunDirW();
 	float sunFwd = max(dot(dir, sd), 0.0);    // 视线-太阳夹角（前向散射）
 	// 风位移：worldTimeCounter 在 Iris 1.7.2 不注入值（恒 0）——
-	// 云完全静止 + 头顶 localCoverage 永远卡在无云值 = "云一直没动、
-	// 头顶自始自终没有云"的根因。改用 frameTimeCounter（每秒 +1，
-	// Iris 确定支持）×5：风速 ≈ 2e-3×5 = 0.01 噪声单元/秒
-	// ≈ 25 格/秒（用户调参：运动速度砍半，原 ×10 = 50 格/秒）
+	// 改用 frameTimeCounter（每秒 +1，Iris 确定支持）×5：
+	// 风速 ≈ 2e-3×5 = 0.01 噪声单元/秒 ≈ 25 格/秒
 	vec3 wind = vec3(2e-3, 2e-4, 1e-3) * frameTimeCounter * 5.0;
-	for (int i = 0; i < maxSteps; i++) {
+	for (int i = 0; i < 32; i++) {
 		if (t > maxT) break;
 		vec3 p = cameraPosition + dir * (t + dt * 0.5);
-		// 抖动（防条带）：固定幅度 30 格 ≈ 1% 主噪声周期（2500 格），
-		// 大步长下也能打散采样对齐；只抖 xz
+		// 抖动（防条带）：幅度与步长联动，只抖 xz（垂直不越层）
+		p += vec3(hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3) * dt * 0.3, 0.0,
+		          hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3 + 7.7) * dt * 0.3);
+		float d = cloudVolumeDensityHQ(p, cloudDensity, wind, dt);
+		if (d < 1e-4) { t += dt; continue; }   // 稀疏区跳过（省采样）
+		// 太阳光照：前向散射（视线朝向太阳的云亮，pow4 加宽到 ±40°）
+		// + 自阴影（密云背光侧暗，阈值对齐重映射后的密度）
+		float scat = 0.45 + 0.55 * pow(sunFwd, 4.0);
+		float selfSh = 1.0 - 0.40 * smoothstep(0.25, 0.80, d);
+		// 路径积分：单步 alpha = 1 - exp(-密度 × 吸收系数 × 步长)
+		float a = 1.0 - exp(-d * CLOUD_ABSORB * dt);
+		float w = a * trans;                   // 本步可见贡献（被前方遮挡）
+		lit += w * scat * selfSh;
+		litW += w;
+		trans *= 1.0 - a;
+		float nh = clamp((p.y - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE), 0.0, 1.0);
+		ty += nh * w;
+		tyW += w;
+		cnt++;
+		t += dt;
+	}
+	if (cnt == 0) return skyCol;
+	float alpha = 1.0 - trans;
+	// 平均散射光照 = lit/litW（每可见贡献单位的散射光，0~1）：
+	// 朝向太阳的云 avgLit 高 → 亮，背光/密云 → 暗
+	float avgLit = (litW > 1e-4) ? lit / litW : 0.0;
+	float tyAvg = (tyW > 1e-4) ? ty / tyW : 0.5;
+	vec3 ccol = cloudShade(clamp(avgLit, 0.0, 1.0), df, rainStrength);
+	// 垂直明暗分层弱化：云底微暗、云顶微亮，不刷水平条带
+	ccol = mix(ccol * 0.85, ccol, smoothstep(0.10, 0.60, tyAvg));
+	return mix(skyCol, ccol, clamp(alpha, 0.0, 1.0));
+}
+
+// ===== 2D 体积云（恢复最开始的效果，CLOUDS=1） =====
+// 密度模型：5 oct noise2(x+z, y+z) 伪 3D + 原高度曲线（层状板）。
+// 采样：固定 16 步（原中档默认）、步长上限 400 格、平均密度透射、
+// 最后采样点高度分层——即 2026-08 重写前的最初观感（层状质感
+// 与细噪点均为用户认可并保留的 2D 档风格）。
+vec3 volCloud2D(vec3 dir, vec3 skyCol, float df, float cloudDensity) {
+	// 纯平视：交点趋近无穷，云带退化为地平线细线，省略采样
+	if (abs(dir.y) < 0.001) return skyCol;
+	float camY = cameraPosition.y;
+	float tA = (CLOUD_BASE - camY) / dir.y;   // 与层底平面交点
+	float tB = (CLOUD_TOP - camY) / dir.y;    // 与层顶平面交点
+	float tNear = min(tA, tB);
+	float tFar = max(tA, tB);
+	if (tFar <= 0.0) return skyCol;           // 云层完全在身后
+	tNear = max(tNear, 0.0);                  // 相机在层内：从相机起
+	float maxT = min(tFar, 20000.0);
+	if (tNear >= maxT) return skyCol;
+	// 固定 16 步（原中档默认），步长上限 400 格（最初实现原样）
+	int maxSteps = 16;
+	float dt = min((maxT - tNear) / float(maxSteps), 400.0);
+	float t = tNear;
+	float dens = 0.0;   // 密度累积（几何密度）
+	float lit = 0.0;    // 散射光累积（密度 × 前向散射 × 自阴影）
+	float ty = 0.0;     // 最后采样点垂直高度（末尾垂直分层用）
+	int cnt = 0;
+	vec3 sd = sunDirW();
+	float sunFwd = max(dot(dir, sd), 0.0);    // 视线-太阳夹角（前向散射）
+	vec3 wind = vec3(2e-3, 2e-4, 1e-3) * frameTimeCounter * 5.0;
+	for (int i = 0; i < 16; i++) {
+		if (t > maxT) break;
+		vec3 p = cameraPosition + dir * (t + dt * 0.5);
+		// 固定 30 格抖动（最初实现原样），只抖 xz
 		p += vec3(hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3) * 30.0, 0.0,
 		          hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3 + 7.7) * 30.0);
-		// 密度模型（移植 Derivative CloudVolumeDensity）：
-		// 覆盖场 + 5 oct 3D 噪声 + 垂直高度曲线（云底削薄）
 		float d = cloudVolumeDensity(p, cloudDensity, wind);
 		if (d < 1e-4) { t += dt; continue; }   // 稀疏区跳过（省采样）
-		// 太阳光照（保留）：前向散射（视线朝向太阳的云亮，pow4 加宽
-		// 到 ±40°）+ 自阴影（密云背光侧暗，0.40 弱化不过度发灰）
 		float scat = 0.45 + 0.55 * pow(sunFwd, 4.0);
 		float selfSh = 1.0 - 0.40 * smoothstep(0.1, 0.55, d);
 		dens += d;
@@ -207,18 +271,24 @@ vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDens
 	if (cnt == 0) return skyCol;
 	dens /= float(cnt);
 	lit /= float(cnt);
-	// 透射（密度已在 cloudVolumeDensity 内部乘 ×3×cloudDensity，
-	// 这里不再额外放大）：dens≈0.5 时 trans≈0.78，密云近实心
+	// 平均密度透射（最初实现原样）：密云近实心，与路径长度无关
 	float trans = 1.0 - exp(-dens * 3.0);
-	// 平均散射光照 = lit/dens（每密度单位的散射光，0~1）：
-	// 朝向太阳的云 avgLit 高 → 亮，背光/密云 → 暗
+	// 平均散射光照 = lit/dens（每密度单位的散射光，0~1）
 	float avgLit = (dens > 0.001) ? lit / dens : 0.0;
 	vec3 ccol = cloudShade(clamp(avgLit, 0.0, 1.0), df, rainStrength);
-	// 垂直分层：云底暗冷、云顶亮（ty = 最后采样点归一化高度，
-	// 0=层底 1=层顶）——云有上下明暗层次，不是均匀色块
-	//（0.6 → 0.7：云底提亮配合"云更白"，层次保留）
+	// 最后采样点高度分层（最初实现原样）：云底暗冷、云顶亮
 	ccol = mix(ccol * 0.7, ccol, smoothstep(0.15, 0.5, ty));
 	return mix(skyCol, ccol, clamp(trans, 0.0, 1.0));
+}
+
+// ===== 体积云入口（两档：1 = 2D 云 / 2 = 3D 云） =====
+// cloudLevel：调用方传入 CLOUDS 选项值（0 关 / 1 2D / 2 3D）
+// cloudDensity：调用方传入 CLOUD_DENSITY/100（0.75 = 减半后基准）
+// ——lib 文件不允许直接用选项宏
+vec3 volCloud(vec3 dir, vec3 skyCol, float df, float cloudLevel, float cloudDensity) {
+	if (cloudLevel < 0.5) return skyCol;
+	if (cloudLevel > 1.5) return volCloud3D(dir, skyCol, df, cloudDensity);
+	return volCloud2D(dir, skyCol, df, cloudDensity);
 }
 
 // ===== 月亮：固定满月 + 细节 =====
