@@ -93,13 +93,14 @@ void main() {
 	// 采样/不采样跳变（"黑色影子"）。skyUnder 像素（背后=天空）走
 	// 程序化天空（方向扰动，见下方分支）。
 	// 作用范围：水面像素（水面上看水面）+ 水下看水面以上内容
-	//（uThroughWater：方块/岸/树透过水面显示——世界视线方向朝上，
+	//（方块/岸/树透过水面显示——世界视线方向朝上，
 	// 而不是屏幕坐标 y>0：抬头时屏幕下半同样朝上看景物，旧判定漏掉）
 	vec3 uVpNow = viewPosFromDepth(d, texcoord);
 	vec3 uUpV = normalize(gbufferModelView[1].xyz); // 视空间上方向
 	vec3 uViewV = normalize(uVpNow);                // 视空间视线方向
-	bool uThroughWater = (isEyeInWater > 0.5 && dot(uViewV, uUpV) > 0.0);
-	if ((texture(colortex1, texcoord).b > 0.5 || uThroughWater)
+	// 水下看水面以上景物不再做屏幕平移折射（用户反馈：方块材质呈
+	// 水面波纹扭曲）；所有水下像素统一走雾与阴影处理
+	if (texture(colortex1, texcoord).b > 0.5
 	 && texture(colortex3, texcoord).r < 0.9995) {
 		vec3 uWpW = worldPosFromView(uVpNow);
 		float uAmpW = (WAVE_AMOUNT / 100.0) * 0.35 * (1.0 + wetness * 1.2);
@@ -110,45 +111,17 @@ void main() {
 		// 融化"）：偏移只由波浪法线决定（波浪连续 → 偏移连续），整个
 		// 透过水面的画面随波浪一致平移——方块轮廓随波浪移动
 		vec2 uRefr = (uUpV.xy - uNvW.xy) * 0.8;
-		// 距离衰减：屏幕空间折射位移应 ∝ 1/相机到水面距离。旧固定
-		// 系数在远处水面同样按 0.8 平移 UV，而远处每个像素覆盖更大
-		// 的世界范围（跨过更多波纹/水底内容）= 视觉扭曲被放大——
-		// 观察者离水面越远，水面扭曲越严重（用户反馈根因）。
-		// 8 格基准线性衰减：8 格内保持原强度（水边正常）、16/32 格
-		// 减弱到 50%/25%、远处水面渐静。不恢复 Derivative 的深度差
-		// 比例（水底/方块深度跳变会造成边缘撕裂），只用连续距离项
+		// 距离衰减：屏幕空间折射位移应 ∝ 1/相机到水面距离
 		float uDistW = length(uVpNow);
 		uRefr *= clamp(8.0 / max(uDistW, 0.5), 0.0, 1.0);
 		// 水面上往水下看：整体强度再降 1/3（0.8 → 0.533，用户要求）
-		// 仅作用于水上看水底分支；水下透水面（uThroughWater）保持
-		// 上一版调好的整体平移强度
-		if (!uThroughWater) uRefr *= 2.0 / 3.0;
+		uRefr *= 2.0 / 3.0;
 		vec2 uUVr = texcoord + uRefr;
 		float uDepthR = texture(colortex3, uUVr).r;
-		if (uThroughWater) {
-			// 水下透水面看景物：整体画面平移（不再用深度门禁 mix——
-			// mix 只让材质颜色移动、轮廓固定，边缘还采到未绘制的
-			// gcolor 天空 = 黑色区域）。这里无条件取偏移点颜色：
-			// 材质与轮廓一起随波浪移动（理想效果）；偏移点落在天空
-			// 时，gcolor 的天空还是黑的，按折射后的视线方向程序化
-			// 绘制天空——景物边缘随波浪弯曲后露出的背景是天空，
-			// 不再是轮廓内黑区
-			vec3 uColR = texture(gcolor, uUVr).rgb;
-			if (uDepthR > 0.9995) {
-				vec3 uRdR = normalize(uViewV + (uUpV - uNvW) * 0.5);
-				vec3 uWdR = normalize(mat3(gbufferModelViewInverse) * uRdR);
-				uColR = getSkyColor(uWdR, STARS / 100.0, SUN_GLOW / 100.0,
-				                    SUN_SIZE / 100.0, MOON_SIZE / 100.0,
-				                    STAR_DENSITY / 100.0, float(CLOUDS),
-				                    float(CLOUD_DENSITY) / 100.0) * PRE_EXPOSURE;
-			}
-			color = uColR;
-		} else {
-			// 水面像素（水上看水底）：保持原单端规则——水底深度本就
-			// 比水面远（Δd>0），"更远就采样"是水底折射正常工作的前提
-			float uVd = smoothstep(d - 0.04, d - 0.001, uDepthR);
-			color = mix(color, texture(gcolor, uUVr).rgb, uVd);
-		}
+		// 水面像素（水上看水底）：保持原单端规则——水底深度本就
+		// 比水面远（Δd>0），"更远就采样"是水底折射正常工作的前提
+		float uVd = smoothstep(d - 0.04, d - 0.001, uDepthR);
+		color = mix(color, texture(gcolor, uUVr).rgb, uVd);
 	}
 	// SSR 调试变量（DEBUG_SSR 可视化用，默认不产生任何开销）
 	float dbgSsrWater = 0.0;  // waterMask：水面识别（alpha+深度+邻居一致性）
@@ -214,7 +187,8 @@ void main() {
 	// skyUnder → 手被画成天空 = "手透明"）
 	bool skyUnder = (isEyeInWater > 0.5 && texture(colortex1, texcoord).b > 0.5
 	              && texture(colortex3, texcoord).r > 0.9995);
-	if ((d > 0.9995 && (dist > far * 0.98 || dist > fogEnd)) || skyUnder) {
+	if ((d > 0.9995 && (dist > far * 0.98 || dist > fogEnd)) || skyUnder
+	 || (isEyeInWater > 0.5 && d > 0.9995)) {
 		vec3 vp = viewPosFromDepth(d, texcoord);
 		vec3 viewDir = normalize(vp);
 		// 世界空间视线（天空随世界转动，不绑定视角）
@@ -236,16 +210,35 @@ void main() {
 		} else {
 			worldDir = normalize(mat3(gbufferModelViewInverse) * viewDir);
 		}
-		color = getSkyColor(worldDir, STARS / 100.0, SUN_GLOW / 100.0, SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0, float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
-		if (skyUnder) {
-			// 丁达尔：折射视线与太阳方向匹配 → 太阳光束亮光（从水下
-			// 看水面，太阳方向的水面 = 光束入口，柔和亮带而非点斑）
-			float uSmU = pow(max(dot(normalize(uRdU), sunDirV()), 0.0), 12.0);
-			color += vec3(1.0, 0.95, 0.85) * uSmU * (SUN_STRENGTH / 100.0) * 0.3;
+		if (isEyeInWater > 0.5 && worldDir.y < 0.0) {
+			// 水下看向视距外（无几何/天空）：用程序化水雾色代替暗
+			// 地平线色，否则视距外水底一片黑
+			vec3 skyUpU = getSkyColor(vec3(0.0, 1.0, 0.0), STARS / 100.0, SUN_GLOW / 100.0,
+			                          SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0,
+			                          0.0, 0.0);
+			color = mix(skyUpU * 0.5, vec3(dot(skyUpU, vec3(0.3333)) * 0.08), 0.8 * wetness) * 0.3183 * 2.8;
+		} else {
+			// 水下：折射天空（skyUnder）太阳盘面 ×0.75；水下非水面
+			// 天空像素不画太阳盘面（避免与折射太阳并存 = 两个太阳）
+			float sunSizeU = (isEyeInWater > 0.5 && !skyUnder) ? 0.0
+			               : (skyUnder ? SUN_SIZE * 0.1 / 100.0 : SUN_SIZE / 100.0);
+			// 月亮只夜间可见（白天月亮会与太阳并存 = 第二个太阳）
+			float moonSizeU = (1.0 - dfFog) * MOON_SIZE / 100.0;
+			color = getSkyColor(worldDir, STARS / 100.0, SUN_GLOW / 100.0,
+			                    sunSizeU, moonSizeU, STAR_DENSITY / 100.0,
+			                    float(CLOUDS), float(CLOUD_DENSITY) / 100.0);
 		}
-		// 太阳泛光：屏幕空间投影位置（盘面细节在 sky.glsl sunDetail 中世界空间绘制）
+		if (skyUnder) {
+			// 丁达尔亮带：pow600——半径约为现在的 1/3
+			float uSmU = pow(max(dot(normalize(uRdU), sunDirV()), 0.0), 600.0);
+			color += vec3(1.0, 0.95, 0.85) * uSmU * (SUN_STRENGTH / 100.0) * 0.08;
+		}
+		// 太阳泛光：屏幕空间投影位置（盘面细节在 sky.glsl sunDetail 中世界空间绘制）。
+		// skyUnder（水下透过波浪看天空）时跳过：程序化天空里的太阳盘面
+		// 已随折射方向偏移，再叠未折射的屏幕泛光 = 折射太阳 + 太阳
+		// 本体两个太阳
 		vec4 sunClip = gbufferProjection * vec4(sunPosition, 1.0);
-		if (sunClip.w > 0.0) {
+		if (!skyUnder && isEyeInWater < 0.5 && sunClip.w > 0.0) {
 			vec2 sunUV = sunClip.xy / sunClip.w * 0.5 + 0.5;
 			// 纵横比修正：屏幕空间保持圆形
 			vec2 sunS = vec2(sunUV.x * aspectRatio, sunUV.y);
@@ -342,15 +335,28 @@ void main() {
 	// 红通道最快衰减 → 过渡区红耗尽呈深绿、深水区蓝主导呈深蓝。
 	// 水雾色 = 天光 × 0.4 × rPI（昼夜/天气驱动），雨天混向灰度 ×0.1
 	if (isEyeInWater > 0.5) {
-		// 水下雾（Derivative WaterFog 式，提亮版）：RGB 分离吸收
-		//（红最快衰减）→ 浅水清澈、过渡深绿、深水区蓝主导深蓝；
-		// 水雾色 = 天光 × 0.4 × rPI × 2.5（提亮——原系数太黑）
+		// 水下雾（2026-08-?? 用户反馈"水下观察水下景物：白天水底
+		// 只是发亮、偏深蓝叠加灰色、细节不清楚"后调参）：
+		// 吸收 0.52/0.18/0.11 → 0.12/0.045/0.03（红通道衰减是深蓝灰
+		// 主因）；水色 0.4×rPI×2.5 → 0.5×rPI×1.2，更偏天光蓝且
+		// 总量降低——浅水景物颜色/细节保留，深水仍渐深蓝
 		vec3 skyI = getSkyColor(vec3(0.0, 1.0, 0.0), STARS / 100.0, SUN_GLOW / 100.0,
 		                        SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0,
 		                        0.0, 0.0) * PRE_EXPOSURE;
-		vec3 wfCol = mix(skyI * 0.4, vec3(dot(skyI, vec3(0.3333)) * 0.1), 0.8 * wetness) * 0.3183 * 2.5;
-		vec3 uTransW = exp(-vec3(0.52, 0.18, 0.11) * dist);
-		color = color * uTransW + wfCol * (1.0 - uTransW);
+		vec3 wfCol = mix(skyI * 0.5, vec3(dot(skyI, vec3(0.3333)) * 0.08), 0.8 * wetness) * 0.3183 * 2.8;
+		// 黑暗渐隐（用户定标）：8 格内完全可见，8~18 格逐渐暗入黑暗，
+		// 18 格以外几乎纯黑——像游戏里的黑暗效果，只能看到附近景物。
+		// 不再是"染色"或"模糊"（那两条路都被用户否掉：深蓝灰叠加
+		// 轮廓仍在、模糊让水底发黑）
+		float fogK = smoothstep(10.0, 32.0, dist);
+		vec3 darkFog = wfCol * 0.7;   // 32 格外 = 深水区颜色（深蓝，非纯黑）
+		vec3 uTransW = vec3(1.0 - fogK);
+		if (d > 0.9995) {
+			// 视距外/天空无内容：直接覆盖为黑暗底色
+			color = darkFog;
+		} else {
+			color = color * uTransW + darkFog * fogK;
+		}
 	}
 	// ===== 水底太阳/月光直射阴影 + 直射穿透（2026-08-13 用户要求恢复） =====
 	// 水下地形（非水面/非天空）像素重算 sh 判定（shadowtex1，与
@@ -360,13 +366,18 @@ void main() {
 	// 夜晚月光 ≈0.06×月光——阴影区 ×(1-directRatio)。放在雾之后
 	//（对比最强）、水下光斑之前
 	if (isEyeInWater > 0.5 && d < 0.9995 && texture(colortex1, texcoord).b < 0.5) {
+		// 水下所有非水面像素统一做阴影重算/直射补回——消除区域间
+		// 的处理分界线（用户反馈）
 		vec3 wpS = worldPosFromView(viewPosFromDepth(d, texcoord));
 		uShUnder = shadowSample(wpS, vec3(0.0, 1.0, 0.0), 1);
 		float dfU = dayFactorF();
 		float sunRatioU = 0.25 * (SUN_STRENGTH / 100.0) * dfU;                  // 太阳直射相对占比
 		float moonRatioU = 0.06 * (MOON_STRENGTH / 1000.0) * (1.0 - dfU) * 0.335; // 月光直射相对占比
 		float directRatioU = clamp((sunRatioU + moonRatioU) * 1.6, 0.0, 0.45);
-		color *= 1.0 - directRatioU * (1.0 - uShUnder);
+		// 黑暗渐隐区阴影同步熄灭：8~18 格外水底已是黑暗，不应再出现
+		// 明显的水底阴影边界（用户反馈）
+		float darkK = smoothstep(20.0, 32.0, dist);   // 阴影 20~32 格渐弱、32 格外熄灭
+		color *= 1.0 - directRatioU * (1.0 - uShUnder) * (1.0 - darkK);
 		// 水底直射穿透（用户要求"水底被太阳照亮"）：水下雾（RGB 吸收，
 		// 红通道 5 格水仅剩 ~18%）把 gbuffers 的直射冲淡 → 雾后颜色 =
 		// 天光雾色主导，受光区没有太阳直射的暖亮感。按水深透射
@@ -375,17 +386,90 @@ void main() {
 		// 近似 1.0（开阔水底天光高，复合阶段无逐像素光照图坐标）。
 		// ×0.5 防与 gbuffers 已算直射重复叠加
 		vec3 albedoU = texture(colortex2, texcoord).rgb;
-		vec3 uTransW = exp(-vec3(0.52, 0.18, 0.11) * dist); // 与雾块同系数（作用域不可达重算）
+		vec3 uTransW = vec3(1.0 - smoothstep(10.0, 32.0, dist)); // 与水下雾块同公式（作用域不可达重算）
 		float ndlU = clamp(dot(vec3(0.0, 1.0, 0.0), sunDirV()), 0.0, 1.0);
 		float rainAttenU = 1.0 - 0.9 * wetness;
 		vec3 sunDirectU = albedoU * vec3(1.0, 0.95, 0.88)
-		                * (0.30 * (SUN_STRENGTH / 100.0)) * ndlU * dfU * uShUnder
-		                * rainAttenU;
+		                * (0.15 * (SUN_STRENGTH / 100.0)) * ndlU * dfU * uShUnder
+		                * rainAttenU;   // 0.30→0.15：太阳光对水底亮度影响减半
 		float ndmU = clamp(dot(vec3(0.0, 1.0, 0.0), moonDirV()), 0.0, 1.0);
 		vec3 moonDirectU = albedoU * vec3(0.45, 0.5, 0.75)
 		                 * (0.06 * (MOON_STRENGTH / 1000.0)) * ndmU * (1.0 - dfU) * uShUnder
 		                 * 0.5 * rainAttenU;
 		color += (sunDirectU + moonDirectU) * uTransW * 0.5;
+	}
+	// ===== 水下体积光（Derivative Main UnderwaterVolumetricLight 移植） =====
+	// 沿视线 12~22 步 marching（长度上限 24 格）：步进在阴影图空间
+	// 进行（与渲染端同一 ShadowDistortion 变换），每步单采样
+	// shadowtex1（仅不透明深度：水面上方岸/树遮挡产生光柱明暗图案，
+	// 水面自身不遮挡水底）。散射 = Σ sampleShadow × transmittance ×
+	// (1-stepTrans)，phase = 水中折射光方向与视线的双 HG 前向散射
+	// （朝太阳方向看最亮），输出 = 8/coeff × directIlluminance ×
+	// scattering × phase × 0.1（Derivative 原式）× 0.03（标定到晨辉
+	// 预曝光域）。GODRAYS=2 强度 ×1.5。
+	if (GODRAYS > 0 && isEyeInWater > 0.5 && d < 0.9995) {
+		float dfUG = dayFactorF();
+		if (dfUG > 0.02) {
+			vec3 vpG = viewPosFromDepth(d, texcoord);
+			vec3 worldDirG = normalize(worldPosFromView(vpG) - cameraPosition);
+			float rayLength = min(24.0, length(vpG));
+			int steps = int(12.0 + 0.5 * rayLength);
+			steps = min(steps, 22);
+			float stepLength = rayLength / float(steps);
+			// 阴影空间线性步进（Derivative：shadowStep = 沿视线一步的
+			// 阴影投影差；起点 = 相机投影）
+			vec3 clip0 = projMAD(shadowProjection, transMAD(shadowModelView, vec3(0.0)));
+			vec3 clip1 = projMAD(shadowProjection, transMAD(shadowModelView, worldDirG * stepLength));
+			float df0 = quarticLength(clip0.xy * 1.165) * 0.9 + 0.1;
+			float df1 = quarticLength(clip1.xy * 1.165) * 0.9 + 0.1;
+			vec3 sp0 = clip0 * vec3(vec2(1.0 / df0), 0.2) * 0.5 + 0.5;
+			vec3 sp1 = clip1 * vec3(vec2(1.0 / df1), 0.2) * 0.5 + 0.5;
+			vec3 shadowStep = sp1 - sp0;
+			float dith = hash1(gl_FragCoord.x * 0.7 + gl_FragCoord.y * 1.3);
+			vec3 shadowPos = sp0 + shadowStep * dith;
+			const vec3 coeff = vec3(0.4, 0.14, 0.08) + 0.02;
+			vec3 stepTrans = exp(-coeff * stepLength);
+			vec3 transmittance = vec3(1.0);
+			vec3 scattering = vec3(0.0);
+			for (int i = 0; i < 22; i++) {
+				if (i >= steps) break;
+				shadowPos += shadowStep;
+				if (shadowPos.x < 0.0 || shadowPos.x > 1.0 || shadowPos.y < 0.0 || shadowPos.y > 1.0) continue;
+				float sd = texture(shadowtex1, shadowPos.xy).r;
+				// 空区（d>0.995）恒受光；受光 d + bias > pz（晨辉约定）
+				vec3 sampleShadow = (sd > 0.995) ? vec3(1.0)
+				                 : vec3((sd + 1e-4 > shadowPos.z) ? 1.0 : 0.0);
+				scattering += sampleShadow * transmittance * (vec3(1.0) - stepTrans);
+				transmittance *= stepTrans;
+			}
+			// 保险：阴影图采样全越界（矩阵异常/越界路径）导致散射为 0 时，
+			// 用当前像素的水底阴影给基础散射，体积光不至于完全消失
+			if (dot(scattering, vec3(1.0)) < 1e-4) {
+				scattering = vec3(0.45) * (0.15 + 0.85 * uShUnder);
+			}
+			// 水中折射光方向 + 双 HG 相位。用户反馈光斑过大：g 提为
+			// 0.9/0.75（更前向）+ 窄方向门控 pow(LdotV,6)，整体 ×0.25，
+			// 基础值降到 0.03——体积光只在正对太阳方向窄范围内明显，
+			// 不再扩散成大型圆斑；水底背向保持很淡
+			vec3 lightVector = refract(sunDirW(), vec3(0.0, -1.0, 0.0), 1.0 / 1.3333);
+			float LdotV = dot(lightVector, worldDirG);
+			float g1 = 0.9;
+			float g2 = 0.75;
+			float phase = (1.0 - g1 * g1) / (4.0 * 3.14159 * pow(1.0 + g1 * g1 - 2.0 * g1 * LdotV, 1.5))
+			            + (1.0 - g2 * g2) / (4.0 * 3.14159 * pow(1.0 + g2 * g2 - 2.0 * g2 * LdotV, 1.5));
+			// 光斑收敛：方向门控 pow(LdotV,120)（半宽 ~5°，与盘面同级），
+			// 峰值 clamp 4.0、基础 0.10——正对太阳亮而小，体积光柱路径
+			// 靠散射累积 + 基础值保持可见，不再扩散成大光斑
+			// 存在感增强：基础 0.06→0.12、峰值 8→12（光柱更亮更明显，
+			// 窄门控 pow120 不变，光斑不扩大）
+			float phaseF = max(min(phase * pow(max(LdotV, 0.0), 120.0), 12.0), 0.12);
+			vec3 sunCol = vec3(1.0, 0.95, 0.88) * (SUN_STRENGTH / 100.0) * dfUG * (1.0 - 0.95 * wetness);
+			vec3 godCol = (8.0 / coeff) * sunCol * scattering * phaseF * 0.1 * 0.30
+			            * (1.0 + 0.5 * float(GODRAYS - 1))
+			            * uShUnder   // 硬门控：头顶有遮挡（阴影）处体积光完全熄灭
+			            * (1.0 - smoothstep(20.0, 32.0, dist));   // 32 格外体积光熄灭
+			color += godCol;
+		}
 	}
 	// ===== 逆预曝光 + HDR 软压缩（修复光斑压平与高光溢出） =====
 	// gbuffers 写入前已乘 PRE_EXPOSURE 0.62（把 HDR 压进 RGBA8 量化范围），
@@ -406,12 +490,8 @@ void main() {
 	// 未命中/出屏回退天空色（与主天空同一函数同一雾混合），
 	// 命中点再按距离补雾——远岸山体反射不会突兀清晰
 	{
-		// 眼睛在水下时不做 SSR：水下抬头视线从下往上穿过水面，
-		// 反射方向 R=reflect(viewDir,nV) 朝下回到水里——SSR 会在
-		// 水下找"反射内容"（物理错误：水下看水面是透射看天空，
-		// 不是反射）。跳过 SSR 后水面显示 gcolor 内容（alpha=0
-		// 后 = 透过的水下景物/天空，水下蓝色由 UNDERWATER_FOG/
-		// fogUnder 提供）
+		// 眼睛在水下时不做 SSR：水下抬头看水面是透射看天空/景物，
+		// 不是镜面反射（用户已确认去除水底屏幕空间反射）
 		// 水面识别（v3 材质标志）：colortex1.b = 水面材质标志——
 		// gbuffers_water 显式写 1.0，其余所有 gbuffers 程序显式写
 		// 0.0（写 a=1 保证 blend 程序下也确定性覆盖）。不再用
@@ -463,15 +543,20 @@ void main() {
 				// 放在 SSR 之前：水雾作用于水底透射部分，反射在表面
 				// 之上不受吸收（Derivative 同序：WaterFog 作用 diffuse，
 				// specular 反射独立叠加）
-				// 水面看水下（Derivative WaterFog 式，提亮版）：RGB 分离
-				// 吸收（0.08 雾量系数——浅水清澈、过渡深绿、深水深蓝）；
-				// 水雾色 = 天光 × 0.4 × rPI × 2.5（提亮——原系数太黑）
-				float uFogD = (0.08 + 0.05 * wetness) * waterDepth;
-				vec3 uTransW = exp(-(vec3(0.4, 0.14, 0.08) * 8.0 + 0.03) * uFogD);
+				// 水面看水下（2026-08-?? 用户反馈"白天水底只是发亮、
+				// 偏深蓝叠加灰色、景物细节不清楚"后调参）：
+				// 雾量 0.08→0.05（浅水更清）；吸收大幅降低（红 0.4→
+				// 0.22、绿 0.14→0.08）——红通道过快衰减是"深蓝灰"的
+				// 主因；水色叠加 2.5→1.5 且更偏天光蓝（0.4→0.55）——
+				// 不再把水底整体提成发亮的灰蓝，透出的水底保留细节
+				// 用户定标（水面看水下）：5 格内较清，5~16 格渐雾，
+				// 16 格+深水区看不清水底
+				float uFogD = smoothstep(5.0, 16.0, waterDepth);
+				vec3 uTransW = mix(vec3(1.0), vec3(0.02, 0.08, 0.20), uFogD);
 				vec3 skyIW = getSkyColor(vec3(0.0, 1.0, 0.0), STARS / 100.0, SUN_GLOW / 100.0,
 				                         SUN_SIZE / 100.0, MOON_SIZE / 100.0, STAR_DENSITY / 100.0,
 				                         0.0, 0.0) * PRE_EXPOSURE;
-				vec3 wfColW = mix(skyIW * 0.4, vec3(dot(skyIW, vec3(0.3333)) * 0.1), 0.8 * wetness) * 0.3183 * 2.5;
+				vec3 wfColW = mix(skyIW * 0.55, vec3(dot(skyIW, vec3(0.3333)) * 0.08), 0.8 * wetness) * 0.3183 * 1.5;
 				color = color * uTransW + wfColW * (1.0 - uTransW);
 
 			vec3 R = reflect(viewDir, nV);
@@ -612,18 +697,9 @@ void main() {
 									vec2 suvH = rayPos.xy * vec2(1.0 / viewWidth, 1.0 / viewHeight);
 									vec3 hitWp = worldPosFromView(viewPosFromDepth(depth, suvH));
 									vec3 rayWp = worldPosFromView(viewPosFromDepth(rayPos.z, suvH));
-									// 临时调试记录（debug 16）：ray 重建点低于水面 → break
 									if (rayWp.y < waterWp.y) { dbgMissReason = 2.0; break; }
-									// 高度判据（v2）：命中点必须高于水面——物理
-								// 镜面反射的内容在镜子之上。旧判据
-								// hitWp.y>rayWp.y 在俯视浅水区失效：ray 沿
-								// 屏幕向上走到更远处的浅水区像素，那些像素
-								// 视线斜向下，深度穿越必伴随"近点更高"→
-								// 水底/水下海带照常命中（反射区域≈浅水区
-								// 面积、水草出现在反射里的根因）。改以水面
-								// 高度为基准：水底永远低于水面 → 排除；
-								// 岸边/山体/建筑高于水面 → 保留。容差
-								// 0.15 = 波浪起伏(±0.05) + 深度重建误差
+									// 高度判据：命中点必须高于水面（岸/山/建筑）；
+									// 容差 0.15 = 波浪起伏 + 深度重建误差
 								if (hitWp.y > waterWp.y + 0.15) {
 									dbgSsrCand = 1.0;
 										// 二分细化 6 步收敛到精确交点（防反射
@@ -828,6 +904,7 @@ void main() {
 			cauAddAmt = clamp(uCau * 0.5, 0.0, 1.2) * uAtten * dfFog * (1.0 - wetness * 0.7);
 			cauAddAmt *= upF; // 朝向渐变：缓坡光斑渐弱
 			cauAddAmt *= uShUnder; // 阴影处排除光斑（shadowSample 门控）
+			cauAddAmt *= 1.0 - smoothstep(20.0, 32.0, dist); // 32 格外光斑熄灭（深水区）
 			color += cauAddCol * cauAddAmt;
 		}
 	}

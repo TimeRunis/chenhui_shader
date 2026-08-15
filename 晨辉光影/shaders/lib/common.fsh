@@ -203,10 +203,10 @@ float shadowSample(vec3 worldPos, vec3 n, int taps) {
 	// 采样（与 Derivative 的 shadowProjPos 直接相加一致）
 	float penumbra = max(penumbraRatio * shadowProjection[0].x / max(distortFactor, 1e-4), 2.0 / shadowRes);
 	// ⑥ Poisson PCF（Derivative PercentageCloserFilter 原式）：
-	// 16/8 采样 + dither 旋转；z 微抖动（shadowProjPos.z -= 1e-4 - dither*5e-5）
-	// 防 acne。手动深度比较 shadowtex1（仅不透明深度，水面不遮挡水底）——
-	// Iris 1.7.2 硬件比较方向不可控实测恒受光，改手动采样比较（晨辉既定）
-	int smp = (taps >= 2) ? 16 : 8;
+	// 16 采样固定（原 taps=1 时 8 采样）——方块侧面半影半径大，
+	// 8 采样不足会产生条纹状阴影并随波浪/视角闪烁（用户反馈），
+	// 16 采样让条纹显著细化
+	int smp = 16;
 	float pz = p.z - (1e-4 - dither * 5e-5);  // z 微抖动防 acne
 	float s = 0.0;
 	int cnt = 0;
