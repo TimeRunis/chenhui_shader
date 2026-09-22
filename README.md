@@ -15,14 +15,14 @@
 
 ##预览
 
-![预览图1](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/1.png)
-![预览图2](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/2.png)
-![预览图3](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/3.png)
-![预览图4](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/4.png)
-![预览图5](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/5.png)
-![预览图6](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/6.png)
-![预览图7](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/7.png)
-![预览图8](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@main/preview/8.png)
+![预览图1](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/1.png)
+![预览图2](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/2.png)
+![预览图3](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/3.png)
+![预览图4](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/4.png)
+![预览图5](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/5.png)
+![预览图6](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/6.png)
+![预览图7](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/7.png)
+![预览图8](https://cdn.jsdelivr.net/gh/TimeRunis/chenhui_shader@master/preview/8.png)
 
 ## 安装
 
